@@ -1,0 +1,14 @@
+@import "tailwindcss";
+
+/* Các bảng kê ở tab Báo Cáo Chi Phí là lưới số dày đặc: bật chữ số đều bề
+   ngang để các cột số thẳng hàng, và tắt kiểu làm mảnh nét chữ của WebKit —
+   nét mảnh cộng với lưới kẻ nhạt là thứ làm bảng nhìn bị mờ. */
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    font-variant-numeric: tabular-nums;
+    -webkit-font-smoothing: auto;
+  }
+}

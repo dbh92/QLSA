@@ -1,0 +1,6 @@
+{
+  "name": "Hệ thống Quản lý và Theo dõi Suất ăn",
+  "description": "Hệ thống quản lý, theo dõi chấm công suất ăn theo ca, phân bổ chi phí bộ phận, phân loại người Hàn - người Việt, quản lý sữa và báo cáo thống kê chi phí.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
