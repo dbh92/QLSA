@@ -91,12 +91,24 @@ export const C = {
   headVnChinh: 'FF182C64',
   headVnPhu: 'FF0D3653',
   headVnSinhNhat: 'FF551839',
+  /* Hai cột chia đều của cùng bảng: Tiền Sữa (bg-cyan-900/60) và Nhân Công
+     (bg-teal-900/60), cũng đã trộn lên slate-900. */
+  headMilkShare: 'FF13384C',
+  headLaborShare: 'FF11383D',
 
   textRed200: 'FFFECACA',
   textOrange200: 'FFFED7AA',
   textBlue200: 'FFBFDBFE',
   textSky200: 'FFBAE6FD',
   textPink200: 'FFFBCFE8',
+  textCyan100: 'FFCFFAFE',
+  textTeal100: 'FFCCFBF1',
+
+  /* Chữ của hai cột chia đều — text-cyan-700 / text-teal-700 ở thân bảng,
+     text-cyan-300 / text-teal-300 ở dòng tổng nền tối. */
+  cyan700: 'FF0E7490',
+  cyan300: 'FF67E8F9',
+  teal300: 'FF5EEAD4',
 
 } as const;
 

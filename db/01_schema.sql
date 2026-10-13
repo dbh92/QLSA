@@ -741,6 +741,7 @@ BEGIN
         EffectiveTo   date           NOT NULL,   -- KHÔNG tính ngày này
         Amount        decimal(18,2)  NOT NULL,
         Notes         nvarchar(255)  NULL,
+        CostMonth     char(7)        NULL,       -- 'YYYY-MM', chỉ là NHÃN
         UpdatedAt     datetime2(0)   NOT NULL CONSTRAINT DF_SA_Labor_Updated DEFAULT (SYSDATETIME()),
         CONSTRAINT PK_SA_LaborCost PRIMARY KEY CLUSTERED (LaborId),
         CONSTRAINT CK_SA_Labor_Range  CHECK (EffectiveTo > EffectiveFrom),
@@ -782,11 +783,80 @@ BEGIN
         EffectiveTo   date             NOT NULL,
         Amount        decimal(18,2)    NOT NULL,
         Notes         nvarchar(255)    NULL,
+        CostMonth     char(7)          NULL,
         CONSTRAINT PK_SA_LaborCostApplied PRIMARY KEY CLUSTERED (AppliedId),
         CONSTRAINT FK_SA_LaborApplied_Batch FOREIGN KEY (BatchId)
             REFERENCES dbo.SA_LaborCostBatch (BatchId)
     );
     CREATE INDEX IX_SA_LaborApplied_Batch ON dbo.SA_LaborCostApplied (BatchId, WorkerName, EffectiveFrom);
+END
+GO
+
+/* Cột THÁNG của một đợt (thêm 2026-10-13) — chỉ là NHÃN người dùng chọn ở
+   ô "Tháng". Tiền vẫn chia theo ngày làm việc của [EffectiveFrom,
+   EffectiveTo), và bảng 12 tháng vẫn cắt theo kỳ của SA_CostMonthPeriodOf;
+   không phép tính nào đọc cột này. Nằm ở cả bản chụp để lượt áp dụng giữ
+   nguyên nhãn. ALTER cho máy chủ đã có bảng từ trước. */
+IF COL_LENGTH('dbo.SA_LaborCost', 'CostMonth') IS NULL
+    ALTER TABLE dbo.SA_LaborCost ADD CostMonth char(7) NULL;
+GO
+IF COL_LENGTH('dbo.SA_LaborCostApplied', 'CostMonth') IS NULL
+    ALTER TABLE dbo.SA_LaborCostApplied ADD CostMonth char(7) NULL;
+GO
+
+/* ---------------------------------------------------------------------------
+   18. SA_CostMonthPeriod — KỲ TÍNH CHI PHÍ của từng tháng trong bảng 12 tháng
+
+   Nhà ăn không chốt số theo tháng lịch: một "tháng" của bảng kê thường là
+   25 lúc 22:50 -> 25 tháng sau lúc 22:50 (ngày làm việc 26 -> 25). Bảng này
+   cho mỗi (năm, tháng) một khoảng thời điểm NỬA MỞ [FromDateTime, ToDateTime)
+   và SA_MealCost_GetMonthly xếp mọi thứ vào tháng theo khoảng đó — lượt
+   quẹt, suất nhập tay, sữa, chi phí phát sinh — còn chi phí nhân công thì
+   client cắt theo đúng hai mốc này (`withLaborCost`).
+
+   Tháng KHÔNG có dòng ở đây dùng kỳ mặc định — kỳ chốt số của nhà ăn: 25
+   tháng trước 22:50 -> 25 tháng này 22:50, gọi theo tháng KẾT THÚC kỳ
+   (tháng 01/2026 = 25/12/2025 22:50 -> 25/01/2026 22:50). Quy tắc mặc định
+   đó nằm ở đúng một chỗ: hàm dbo.SA_CostMonthPeriodOf trong
+   03_procedures.sql.
+
+   Một năm được lưu NGUYÊN KHỐI (đủ 12 tháng, hoặc không tháng nào): trộn kỳ
+   tự đặt của tháng này với kỳ mặc định của tháng bên cạnh là hai kỳ chồng
+   lên nhau và một lượt quẹt bị tính hai lần. SA_CostMonthPeriod_Save kiểm
+   điều đó và kiểm cả việc các kỳ trong năm không giao nhau.
+   --------------------------------------------------------------------------- */
+IF OBJECT_ID('dbo.SA_CostMonthPeriod', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.SA_CostMonthPeriod
+    (
+        CostYear     int           NOT NULL,
+        MonthNo      int           NOT NULL,
+        FromDateTime datetime2(0)  NOT NULL,
+        ToDateTime   datetime2(0)  NOT NULL,
+        UpdatedAt    datetime2(0)  NOT NULL CONSTRAINT DF_SA_CostMonthPeriod_Updated DEFAULT (SYSDATETIME()),
+        UpdatedBy    nvarchar(128) NULL,
+        CONSTRAINT PK_SA_CostMonthPeriod PRIMARY KEY CLUSTERED (CostYear, MonthNo),
+        CONSTRAINT CK_SA_CostMonthPeriod_Month CHECK (MonthNo BETWEEN 1 AND 12),
+        CONSTRAINT CK_SA_CostMonthPeriod_Range CHECK (ToDateTime > FromDateTime)
+    );
+END
+GO
+
+/* Kiểu bảng để gửi cả 12 kỳ của một năm trong MỘT lần lưu — cùng lý do với
+   SA_EventIdList: tạo ở đây vì 03_procedures.sql drop/tạo lại procedure, mà
+   kiểu đang được procedure dùng thì không drop được.
+
+   Hai mốc là CHUỖI 'YYYY-MM-DD HH:mm:ss' chứ không phải datetime2: thời điểm
+   đi qua dây dưới dạng chuỗi ở cả hệ thống này (bind Date của JS là lệch múi
+   giờ). SA_CostMonthPeriod_Save tự đổi sang datetime2 bằng style 120. */
+IF TYPE_ID('dbo.SA_CostMonthPeriodList') IS NULL
+BEGIN
+    CREATE TYPE dbo.SA_CostMonthPeriodList AS TABLE
+    (
+        MonthNo      int         NOT NULL PRIMARY KEY,
+        FromDateTime varchar(19) NOT NULL,
+        ToDateTime   varchar(19) NOT NULL
+    );
 END
 GO
 

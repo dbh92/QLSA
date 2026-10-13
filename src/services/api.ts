@@ -18,6 +18,7 @@ import {
   BirthdayConfig,
   ManualMealEntry,
   MonthlyCostRow,
+  CostMonthPeriod,
   SystemSettings,
   ShiftMealCategory,
   GuestDeptOverride,
@@ -134,6 +135,23 @@ export const fetchMealLogs = (from: string, to: string) =>
 /** Chi phí 12 tháng của một năm, tổng hợp sẵn trên SQL Server. */
 export const fetchMonthlyCostTrend = (year: number) =>
   request<MonthlyCostRow[]>(`/monthly-cost-trend?year=${year}`);
+
+/** Kỳ tính chi phí của 12 tháng một năm — xem `CostMonthPeriod`. */
+export const fetchCostMonthPeriods = (year: number) =>
+  request<CostMonthPeriod[]>(`/cost-month-periods?year=${year}`);
+
+/**
+ * Lưu kỳ của CẢ NĂM: đủ 12 kỳ, hoặc mảng rỗng để cả năm quay về kỳ mặc định.
+ * Procedure từ chối kỳ chồng nhau bằng một câu tiếng Việt nêu rõ hai tháng.
+ */
+export const saveCostMonthPeriods = (
+  year: number,
+  periods: { monthNo: number; fromDateTime: string; toDateTime: string }[],
+) =>
+  request<CostMonthPeriod[]>(`/cost-month-periods/${year}`, {
+    method: 'PUT',
+    body: JSON.stringify({ periods }),
+  });
 
 /* -------------------------------------------------------------------------
    Lượt quẹt đã xóa — popup "Điều Chỉnh Số Liệu"
@@ -345,6 +363,8 @@ export const saveLaborCost = (entry: {
   effectiveTo: string;
   amount: number;
   notes?: string;
+  /** 'YYYY-MM' — chỉ là nhãn, xem `LaborCostDraftRow.costMonth`. */
+  costMonth?: string | null;
 }) => post<{ id: number }>('/labor-costs', entry);
 
 export const deleteLaborCost = (id: number) =>

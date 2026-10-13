@@ -32,6 +32,7 @@ import {
   MealPriceItem,
   LargeDepartmentInfo,
   MonthlyCostRow,
+  CostMonthPeriod,
   SystemSettings,
   ShiftMealCategory,
   LaborCostState,
@@ -327,6 +328,59 @@ export default function App() {
   }, [user, trendYear, loadTrend]);
 
   /* ---------------------------------------------------------------------
+     Kỳ tính chi phí của 12 tháng (tab Xu hướng năm) — mỗi tháng là một
+     khoảng thời điểm nửa mở, SA_MealCost_GetMonthly xếp mọi cột theo đó.
+     Nạp cùng năm với bảng 12 tháng; lưu xong thì nạp lại bảng 12 tháng vì
+     mọi con số của nó vừa đổi kỳ.
+     --------------------------------------------------------------------- */
+  const [costPeriods, setCostPeriods] = useState<CostMonthPeriod[]>([]);
+  const [costPeriodsError, setCostPeriodsError] = useState<string | null>(
+    null,
+  );
+
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    setCostPeriodsError(null);
+    api
+      .fetchCostMonthPeriods(trendYear)
+      .then((rows) => {
+        if (!cancelled) setCostPeriods(rows);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setCostPeriods([]);
+        setCostPeriodsError(
+          err instanceof Error ? err.message : "Lỗi không xác định.",
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user, trendYear]);
+
+  const handleSaveCostPeriods = useCallback(
+    async (
+      year: number,
+      periods: { monthNo: number; fromDateTime: string; toDateTime: string }[],
+    ) => {
+      const rows = await api.saveCostMonthPeriods(year, periods);
+      if (year === trendYear) setCostPeriods(rows);
+      await loadTrend(trendYear, true);
+    },
+    [trendYear, loadTrend],
+  );
+
+  /** Kỳ của một năm bất kỳ — ô "Tháng" của màn hình nhân công cần nó. */
+  const fetchCostPeriodsOf = useCallback(
+    async (year: number): Promise<CostMonthPeriod[]> =>
+      year === trendYear && costPeriods.length === 12
+        ? costPeriods
+        : api.fetchCostMonthPeriods(year),
+    [trendYear, costPeriods],
+  );
+
+  /* ---------------------------------------------------------------------
      Nạp log chấm ăn mỗi khi đổi khoảng thời gian.
      Một tháng ~50.000 lượt quẹt nên chỉ gọi lại khi khoảng ngày hợp lệ.
      --------------------------------------------------------------------- */
@@ -546,6 +600,7 @@ export default function App() {
       effectiveTo: string;
       amount: number;
       notes?: string;
+      costMonth?: string | null;
     }) => {
       await api.saveLaborCost(row);
       await reloadLaborCosts();
@@ -890,6 +945,10 @@ export default function App() {
             onDeleteLaborCost={handleDeleteLaborCost}
             onApplyLaborCosts={handleApplyLaborCosts}
             onRestoreLaborBatch={handleRestoreLaborBatch}
+            costPeriods={costPeriods}
+            costPeriodsError={costPeriodsError}
+            onSaveCostPeriods={handleSaveCostPeriods}
+            onFetchCostPeriods={fetchCostPeriodsOf}
             startDateTime={startDateTime}
             endDateTime={endDateTime}
             startDate={startDate}

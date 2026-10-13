@@ -1,19 +1,26 @@
 import React, { useMemo, useState } from "react";
 import { formatVND } from "../../services/mealEngine";
 import {
+  CostMonthPeriod,
   LaborCostBatch,
   LaborCostDraftRow,
   LaborCostState,
   LaborWorkDayRule,
+  ShiftInfo,
 } from "../../types";
 import {
   LABOR_WORKDAY_RULES,
   LABOR_WORKDAY_RULE_LABEL,
   LaborSegment,
   countLaborWorkDays,
+  laborBoundaryDate,
+  laborBoundaryDateTime,
+  laborRangeForPeriod,
   laborTotalAmount,
   laborTotalWorkDays,
+  laborWorkDayFromBoundary,
 } from "./reportModel";
+import { addDays, workDayStartTime } from "../../services/mealEngine";
 import {
   AlertTriangle,
   CalendarRange,
@@ -49,10 +56,19 @@ import {
  * áp dụng" để truy vết. Báo cáo chỉ đọc lượt MỚI NHẤT — cộng hết mọi lượt thì
  * bấm hai lần là tiền nhân đôi.
  *
- * KHOẢNG NGÀY LÀ NỬA MỞ: "Từ ngày" được tính, "Đến ngày" KHÔNG. Nhờ vậy hai
- * đợt viết liền nhau đúng như trên giấy (25/07→25/08 rồi 25/08→25/09) mà ngày
- * 25/08 chỉ thuộc về đúng một đợt. Toàn bộ giao diện dưới đây nói rõ điều đó
- * ở mọi chỗ có ngày, vì đây là thứ dễ hiểu nhầm nhất của tính năng.
+ * MỐC CỦA ĐỢT LÀ 22:50, KHÔNG PHẢI NỬA ĐÊM. Một ngày làm việc chạy từ 22:50
+ * hôm trước tới 22:50 hôm sau (22:50 26/07 -> 22:50 27/07 là MỘT ngày làm
+ * việc, ngày 27/07), nên người dùng nhập và đọc hai mốc 22:50 của đợt:
+ * 25/07 22:50 -> 25/08 22:50 là 31 ngày làm việc 26/07..25/08. Cơ sở dữ liệu
+ * vẫn lưu theo ngày làm việc, nửa mở (26/07 -> 26/08) — chuyển đổi nằm trong
+ * `laborBoundaryDateTime` / `laborWorkDayFromBoundary`, không ở đâu khác. Hai
+ * đợt nối tiếp dùng chung một mốc 22:50 mà không ngày nào bị tính hai lần.
+ *
+ * Ô "Tháng" và hai mốc Từ – Đến chỉnh ĐỘC LẬP. Chọn tháng thì hai mốc được
+ * điền sẵn theo KỲ của tháng đó (cài ở tab Xu hướng năm), rồi người dùng sửa
+ * tiếp mốc nào cũng được mà tháng vẫn giữ nguyên. Tháng được lưu cùng đợt
+ * (`costMonth`) nhưng CHỈ LÀ NHÃN: tiền chia theo ngày làm việc của Từ – Đến,
+ * và bảng 12 tháng vẫn cắt theo kỳ của từng tháng.
  */
 
 interface LaborCostReportProps {
@@ -68,10 +84,17 @@ interface LaborCostReportProps {
     effectiveTo: string;
     amount: number;
     notes?: string;
+    costMonth?: string | null;
   }) => Promise<void>;
   onDelete: (id: number) => Promise<void>;
   onApply: (rule: LaborWorkDayRule, notes?: string) => Promise<void>;
   onRestoreBatch: (batchId: string) => Promise<void>;
+  /** Danh mục ca — giờ bắt đầu ca vắt nửa đêm là mốc 22:50 của ngày làm việc. */
+  shifts: ShiftInfo[];
+  /** Kỳ 12 tháng của năm đang xem — để gọi tên tháng của từng đợt. */
+  costPeriods: CostMonthPeriod[];
+  /** Kỳ 12 tháng của một năm bất kỳ — ô "Tháng" tự điền theo đó. */
+  onFetchCostPeriods: (year: number) => Promise<CostMonthPeriod[]>;
   startDate: string;
   endDate: string;
 }
@@ -80,13 +103,8 @@ interface LaborCostReportProps {
 const fmtDate = (d: string) =>
   d ? `${d.slice(8, 10)}/${d.slice(5, 7)}/${d.slice(0, 4)}` : "—";
 
-/** Ngày cuối CÙNG thật sự được tính của một khoảng nửa mở. */
-function lastCountedDay(toExclusive: string): string {
-  const y = Number(toExclusive.slice(0, 4));
-  const m = Number(toExclusive.slice(5, 7));
-  const d = Number(toExclusive.slice(8, 10));
-  return new Date(Date.UTC(y, m - 1, d - 1)).toISOString().slice(0, 10);
-}
+/** 'YYYY-MM-DD HH:mm' -> 'dd/MM/yyyy HH:mm'. */
+const fmtDateTime = (dt: string) => `${fmtDate(dt.slice(0, 10))} ${dt.slice(11, 16)}`;
 
 /**
  * Hai khoảng NỬA MỞ có giao nhau không: aFrom < bTo AND bFrom < aTo.
@@ -102,8 +120,12 @@ const rangesOverlap = (
   bTo: string,
 ) => aFrom < bTo && bFrom < aTo;
 
+/* `effectiveFrom` / `effectiveTo` giữ NGÀY LÀM VIỆC đúng như lưu xuống cơ sở
+   dữ liệu; ô nhập hiển thị ngày của mốc 22:50 (= ngày làm việc - 1). */
 const EMPTY_FORM = {
   id: null as number | null,
+  /** "YYYY-MM" của ô Tháng — lưu cùng đợt, nhưng chỉ là nhãn. */
+  costMonth: "",
   workerName: "",
   effectiveFrom: "",
   effectiveTo: "",
@@ -119,11 +141,68 @@ export const LaborCostReport: React.FC<LaborCostReportProps> = ({
   onDelete,
   onApply,
   onRestoreBatch,
+  shifts,
+  costPeriods,
+  onFetchCostPeriods,
   startDate,
   endDate,
 }) => {
   const [form, setForm] = useState(EMPTY_FORM);
   const [busy, setBusy] = useState(false);
+  const [monthLoading, setMonthLoading] = useState(false);
+
+  /** Giờ của mốc ngày làm việc, "22:50". */
+  const boundaryTime = workDayStartTime(shifts).slice(0, 5);
+  /** Biên ngày làm việc -> "dd/MM/yyyy 22:50". */
+  const fmtBoundary = (workDay: string) =>
+    fmtDateTime(laborBoundaryDateTime(workDay, shifts));
+
+  /** "YYYY-MM" -> "MM/YYYY". */
+  const fmtMonth = (m: string) => `${m.slice(5, 7)}/${m.slice(0, 4)}`;
+
+  /** Tháng hiển thị của một đợt: tháng đã lưu; đợt cũ chưa có nhãn thì suy
+      ra khi nó trùng khít kỳ của một tháng đang cài. */
+  const monthOf = (r: LaborCostDraftRow) => {
+    if (r.costMonth) return fmtMonth(r.costMonth);
+    const p = costPeriods.find((cp) => {
+      const range = laborRangeForPeriod(cp, shifts);
+      return (
+        range &&
+        range.effectiveFrom === r.effectiveFrom &&
+        range.effectiveTo === r.effectiveTo
+      );
+    });
+    return p ? fmtMonth(p.costMonth) : null;
+  };
+
+  /* Chọn tháng -> hai mốc 22:50 lấy theo KỲ của tháng đó. Kỳ có thể đã được
+     lệch tháng lịch (tháng 01/2026 = 25/12/2025 22:50 -> 25/01/2026 22:50),
+     và kỳ tự đặt còn có thể khác nữa, nên phải hỏi đúng
+     năm của tháng được chọn chứ không tự suy ra. */
+  const handleMonthChange = async (costMonth: string) => {
+    patch({ costMonth });
+    if (!/^\d{4}-\d{2}$/.test(costMonth)) return;
+    setMonthLoading(true);
+    try {
+      const periods = await onFetchCostPeriods(Number(costMonth.slice(0, 4)));
+      const period = periods.find((p) => p.costMonth === costMonth);
+      const range = period ? laborRangeForPeriod(period, shifts) : null;
+      if (!range) {
+        alert(`Chưa đọc được kỳ của tháng ${costMonth}.`);
+        return;
+      }
+      setForm((f) => ({
+        ...f,
+        costMonth,
+        effectiveFrom: range.effectiveFrom,
+        effectiveTo: range.effectiveTo,
+      }));
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Không đọc được kỳ của tháng.");
+    } finally {
+      setMonthLoading(false);
+    }
+  };
   const [rule, setRule] = useState<LaborWorkDayRule | null>(null);
 
   /* Ô chọn quy tắc mặc định theo lượt ĐANG hiệu lực, để bấm "Áp dụng" lần nữa
@@ -168,16 +247,16 @@ export const LaborCostReport: React.FC<LaborCostReportProps> = ({
     }
     if (!effectiveFrom || !effectiveTo) {
       alert(
-        "Đợt thuê phải có cả ngày bắt đầu và ngày kết thúc — công thức chia " +
-          "tiền cần biết đợt dài bao nhiêu ngày.",
+        "Đợt thuê phải có cả mốc bắt đầu và mốc kết thúc — công thức chia " +
+          "tiền cần biết đợt dài bao nhiêu ngày làm việc.",
       );
       return;
     }
     if (effectiveTo <= effectiveFrom) {
       alert(
-        "Ngày kết thúc phải SAU ngày bắt đầu.\n\n" +
-          "Lưu ý: ngày kết thúc không được tính vào đợt, nên hai ngày bằng " +
-          "nhau là một đợt rỗng.",
+        "Mốc kết thúc phải SAU mốc bắt đầu.\n\n" +
+          `Một ngày làm việc chạy từ ${boundaryTime} hôm trước tới ` +
+          `${boundaryTime} hôm sau, nên hai mốc cùng ngày là một đợt rỗng.`,
       );
       return;
     }
@@ -200,9 +279,10 @@ export const LaborCostReport: React.FC<LaborCostReportProps> = ({
     if (clash) {
       alert(
         `Khoảng thời gian bị trùng với đợt đã có của "${workerName}": ` +
-          `${fmtDate(clash.effectiveFrom)} → ${fmtDate(clash.effectiveTo)}.\n\n` +
-          "Hai đợt nối tiếp thì viết chung một ngày là được (25/07→25/08 rồi " +
-          "25/08→25/09), vì ngày kết thúc không được tính vào đợt.",
+          `${fmtBoundary(clash.effectiveFrom)} → ${fmtBoundary(clash.effectiveTo)}.\n\n` +
+          `Hai đợt nối tiếp thì dùng chung một mốc ${boundaryTime} là được ` +
+          `(25/07 ${boundaryTime}→25/08 ${boundaryTime} rồi 25/08 ` +
+          `${boundaryTime}→25/09 ${boundaryTime}).`,
       );
       return;
     }
@@ -215,9 +295,10 @@ export const LaborCostReport: React.FC<LaborCostReportProps> = ({
         effectiveTo,
         amount,
         notes: form.notes.trim(),
+        costMonth: form.costMonth || null,
       });
-      /* Giữ nguyên tên để nhập tiếp đợt kế của cùng người, và mồi sẵn "Từ
-         ngày" bằng ngày kết thúc vừa nhập — đúng cách các đợt nối nhau. */
+      /* Giữ nguyên tên để nhập tiếp đợt kế của cùng người, và mồi sẵn mốc
+         bắt đầu bằng mốc kết thúc vừa nhập — đúng cách các đợt nối nhau. */
       setForm({
         ...EMPTY_FORM,
         workerName,
@@ -229,6 +310,7 @@ export const LaborCostReport: React.FC<LaborCostReportProps> = ({
   const handleEdit = (r: LaborCostDraftRow) =>
     setForm({
       id: r.id,
+      costMonth: r.costMonth ?? "",
       workerName: r.workerName,
       effectiveFrom: r.effectiveFrom,
       effectiveTo: r.effectiveTo,
@@ -239,7 +321,7 @@ export const LaborCostReport: React.FC<LaborCostReportProps> = ({
   const handleDelete = (r: LaborCostDraftRow) => {
     if (
       confirm(
-        `Xoá đợt ${fmtDate(r.effectiveFrom)} → ${fmtDate(r.effectiveTo)} ` +
+        `Xoá đợt ${fmtBoundary(r.effectiveFrom)} → ${fmtBoundary(r.effectiveTo)} ` +
           `của ${r.workerName} khỏi bản nháp?\n\n` +
           "Báo cáo chưa đổi gì cho tới khi bấm “Áp dụng”.",
       )
@@ -257,7 +339,9 @@ export const LaborCostReport: React.FC<LaborCostReportProps> = ({
       effectiveFrom: string;
       effectiveTo: string;
       amount: number;
-    }) => `${r.workerName}|${r.effectiveFrom}|${r.effectiveTo}|${r.amount}`;
+      costMonth: string | null;
+    }) =>
+      `${r.workerName}|${r.effectiveFrom}|${r.effectiveTo}|${r.amount}|${r.costMonth ?? ""}`;
 
     const a = state.draft.map(key).sort();
     const b = state.appliedRows.map(key).sort();
@@ -439,37 +523,83 @@ export const LaborCostReport: React.FC<LaborCostReportProps> = ({
               />
             </div>
 
+            <div>
+              <label className={label}>
+                Tháng{" "}
+                <span className="font-normal text-slate-400">
+                  — điền sẵn hai mốc theo kỳ, sửa lại được
+                </span>
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="month"
+                  value={form.costMonth}
+                  onChange={(e) => handleMonthChange(e.target.value)}
+                  className={`${field} font-semibold`}
+                />
+                {monthLoading && (
+                  <Loader2 className="w-4 h-4 animate-spin text-teal-600 shrink-0" />
+                )}
+              </div>
+            </div>
+
             <div className="grid grid-cols-2 gap-2">
               <div>
                 <label className={label}>
-                  Từ ngày <span className="text-red-500">*</span>
+                  Từ <span className="text-red-500">*</span>
                 </label>
-                <input
-                  type="date"
-                  required
-                  value={form.effectiveFrom}
-                  onChange={(e) => patch({ effectiveFrom: e.target.value })}
-                  className={`${field} font-semibold`}
-                />
-                <div className="text-[10px] text-emerald-700 mt-0.5 font-semibold">
-                  Có tính ngày này
+                <div className="flex items-center gap-1">
+                  <input
+                    type="date"
+                    required
+                    value={
+                      form.effectiveFrom
+                        ? laborBoundaryDate(form.effectiveFrom)
+                        : ""
+                    }
+                    onChange={(e) =>
+                      patch({
+                        effectiveFrom: e.target.value
+                          ? laborWorkDayFromBoundary(e.target.value)
+                          : "",
+                      })
+                    }
+                    className={`${field} font-semibold`}
+                  />
+                  <span className="text-xs font-mono font-bold text-slate-600 shrink-0">
+                    {boundaryTime}
+                  </span>
                 </div>
               </div>
               <div>
                 <label className={label}>
-                  Đến ngày <span className="text-red-500">*</span>
+                  Đến <span className="text-red-500">*</span>
                 </label>
-                <input
-                  type="date"
-                  required
-                  value={form.effectiveTo}
-                  onChange={(e) => patch({ effectiveTo: e.target.value })}
-                  className={`${field} font-semibold`}
-                />
-                <div className="text-[10px] text-red-700 mt-0.5 font-semibold">
-                  KHÔNG tính ngày này
+                <div className="flex items-center gap-1">
+                  <input
+                    type="date"
+                    required
+                    value={
+                      form.effectiveTo ? laborBoundaryDate(form.effectiveTo) : ""
+                    }
+                    onChange={(e) =>
+                      patch({
+                        effectiveTo: e.target.value
+                          ? laborWorkDayFromBoundary(e.target.value)
+                          : "",
+                      })
+                    }
+                    className={`${field} font-semibold`}
+                  />
+                  <span className="text-xs font-mono font-bold text-slate-600 shrink-0">
+                    {boundaryTime}
+                  </span>
                 </div>
               </div>
+            </div>
+            <div className="text-[10px] text-slate-500 -mt-1">
+              Một ngày làm việc = {boundaryTime} hôm trước &rarr; {boundaryTime}{" "}
+              hôm sau.
             </div>
 
             {form.effectiveFrom && form.effectiveTo && (
@@ -477,14 +607,13 @@ export const LaborCostReport: React.FC<LaborCostReportProps> = ({
                 <Info className="w-3.5 h-3.5 shrink-0 mt-0.5 text-slate-400" />
                 {form.effectiveTo <= form.effectiveFrom ? (
                   <span className="text-red-700 font-semibold">
-                    Ngày kết thúc phải sau ngày bắt đầu.
+                    Mốc kết thúc phải sau mốc bắt đầu.
                   </span>
                 ) : (
                   <span>
-                    Đợt tính từ{" "}
-                    <strong>{fmtDate(form.effectiveFrom)}</strong> đến hết{" "}
-                    <strong>{fmtDate(lastCountedDay(form.effectiveTo))}</strong>{" "}
-                    ={" "}
+                    Đợt chạy từ{" "}
+                    <strong>{fmtBoundary(form.effectiveFrom)}</strong> đến{" "}
+                    <strong>{fmtBoundary(form.effectiveTo)}</strong> ={" "}
                     <strong className="font-mono">
                       {countLaborWorkDays(
                         form.effectiveFrom,
@@ -492,7 +621,8 @@ export const LaborCostReport: React.FC<LaborCostReportProps> = ({
                         effectiveRule,
                       ).toLocaleString("vi-VN")}
                     </strong>{" "}
-                    ngày làm việc.
+                    ngày làm việc ({fmtDate(form.effectiveFrom)} &rarr;{" "}
+                    {fmtDate(addDays(form.effectiveTo, -1))}).
                   </span>
                 )}
               </div>
@@ -634,8 +764,9 @@ export const LaborCostReport: React.FC<LaborCostReportProps> = ({
                 <thead className="bg-slate-100 text-slate-700 font-bold uppercase text-[11px] sticky top-0">
                   <tr>
                     <th className={cell}>Họ Tên</th>
-                    <th className={cell}>Từ Ngày</th>
-                    <th className={`${cell} text-teal-800`}>Đến Hết Ngày</th>
+                    <th className={`${cell} text-center`}>Tháng</th>
+                    <th className={cell}>Từ</th>
+                    <th className={cell}>Đến</th>
                     <th className={`${cell} text-center`}>Ngày LV</th>
                     <th className={`${cell} text-right`}>Chi Phí</th>
                     <th className={`${cell} text-right`}>Đơn Giá/Ngày</th>
@@ -655,17 +786,26 @@ export const LaborCostReport: React.FC<LaborCostReportProps> = ({
                             </div>
                           )}
                         </td>
-                        <td className={`${cell} font-mono whitespace-nowrap`}>
-                          {fmtDate(r.effectiveFrom)}
+                        <td
+                          className={`${cell} text-center font-mono text-slate-600 whitespace-nowrap`}
+                          title="Tháng gán cho đợt — chỉ là nhãn, tiền chia theo Từ – Đến"
+                        >
+                          {monthOf(r) ?? "—"}
                         </td>
-                        {/* Hiện NGÀY CUỐI CÙNG ĐƯỢC TÍNH, không hiện ngày kết
-                            thúc thô: người đọc bảng cần biết đợt phủ tới đâu,
-                            và đó là chỗ hiểu nhầm dễ xảy ra nhất. */}
+                        {/* Hiện hai MỐC 22:50 chứ không hiện ngày thô: một
+                            ngày làm việc bắt đầu từ tối hôm trước, và đó là
+                            chỗ hiểu nhầm dễ xảy ra nhất. */}
+                        <td
+                          className={`${cell} font-mono whitespace-nowrap`}
+                          title={`Ngày làm việc đầu tiên: ${fmtDate(r.effectiveFrom)}`}
+                        >
+                          {fmtBoundary(r.effectiveFrom)}
+                        </td>
                         <td
                           className={`${cell} font-mono whitespace-nowrap text-teal-800`}
-                          title={`Ngày kết thúc đã nhập: ${fmtDate(r.effectiveTo)} (không tính)`}
+                          title={`Ngày làm việc cuối cùng: ${fmtDate(addDays(r.effectiveTo, -1))}`}
                         >
-                          {fmtDate(lastCountedDay(r.effectiveTo))}
+                          {fmtBoundary(r.effectiveTo)}
                         </td>
                         <td className={`${cell} text-center font-mono`}>
                           {days.toLocaleString("vi-VN")}
@@ -706,7 +846,7 @@ export const LaborCostReport: React.FC<LaborCostReportProps> = ({
                 </tbody>
                 <tfoot className="bg-slate-800 text-white font-bold text-xs">
                   <tr>
-                    <td className={cell} colSpan={4}>
+                    <td className={cell} colSpan={5}>
                       TỔNG BẢN NHÁP
                     </td>
                     <td
@@ -783,8 +923,8 @@ export const LaborCostReport: React.FC<LaborCostReportProps> = ({
                       {s.workerName}
                     </td>
                     <td className={`${cell} font-mono whitespace-nowrap`}>
-                      {fmtDate(s.periodFrom)} &rarr;{" "}
-                      {fmtDate(lastCountedDay(s.periodTo))}
+                      {fmtBoundary(s.periodFrom)} &rarr;{" "}
+                      {fmtBoundary(s.periodTo)}
                     </td>
                     <td
                       className={`${cell} text-right font-mono whitespace-nowrap`}
@@ -797,7 +937,7 @@ export const LaborCostReport: React.FC<LaborCostReportProps> = ({
                     <td
                       className={`${cell} font-mono whitespace-nowrap bg-teal-50 text-teal-900 font-semibold`}
                     >
-                      {fmtDate(s.from)} &rarr; {fmtDate(s.toInclusive)}
+                      {fmtBoundary(s.from)} &rarr; {fmtBoundary(s.toExclusive)}
                       {s.isFullPeriod && (
                         <span className="ml-1.5 text-[10px] font-bold uppercase text-emerald-700">
                           trọn đợt
@@ -863,9 +1003,11 @@ export const LaborCostReport: React.FC<LaborCostReportProps> = ({
               cho tới khi bấm &ldquo;Áp dụng&rdquo;)
             </>
           )}
-          . Ngày bắt đầu của một đợt được tính, ngày kết thúc thì không — nhờ
-          vậy hai đợt nối tiếp dùng chung một ngày chuyển tiếp mà ngày đó không
-          bị tính hai lần và cũng không rơi mất.
+          . Một ngày làm việc chạy từ {boundaryTime} hôm trước tới{" "}
+          {boundaryTime} hôm sau, nên mọi mốc ở đây đều là {boundaryTime}: đợt
+          25/07 {boundaryTime} &rarr; 25/08 {boundaryTime} gồm 31 ngày làm việc
+          26/07 &rarr; 25/08. Hai đợt nối tiếp dùng chung một mốc mà không ngày
+          nào bị tính hai lần hay rơi mất.
         </div>
       </div>
 

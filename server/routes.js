@@ -948,6 +948,65 @@ router.get(
     res.json(rows);
   }),
 );
+
+/* --------------------------------------------------------------------------
+   Kỳ tính chi phí của từng tháng (bảng 12 tháng)
+   --------------------------------------------------------------------------
+   Mỗi tháng là một khoảng nửa mở [from, to) — xem mục 18 của
+   db/01_schema.sql. Lưu theo NGUYÊN NĂM: đủ 12 kỳ, hoặc mảng rỗng để cả năm
+   quay về kỳ mặc định. Thứ tự hai mốc, độ dài kỳ và luật không chồng nhau do
+   SA_CostMonthPeriod_Save kiểm — endpoint chỉ kiểm định dạng.
+   -------------------------------------------------------------------------- */
+
+function parseYear(value) {
+  const year = parseInteger(value, "year", { min: 2000 });
+  if (year > 2999) throw new HttpError(400, 'Tham số "year" không hợp lệ.');
+  return year;
+}
+
+router.get(
+  "/cost-month-periods",
+  wrap(async (req, res) => {
+    const rows = await queryProc("SA_CostMonthPeriod_Get", [
+      ["Year", sql.Int, parseYear(req.query.year)],
+    ]);
+    res.json(rows);
+  }),
+);
+
+router.put(
+  "/cost-month-periods/:year",
+  wrap(async (req, res) => {
+    const year = parseYear(req.params.year);
+    const periods = req.body?.periods;
+    if (!Array.isArray(periods) || periods.length > 12) {
+      throw new HttpError(400, 'Tham số "periods" phải là danh sách tối đa 12 kỳ.');
+    }
+
+    /* Mốc thời điểm đi xuống dạng CHUỖI (cột varchar(19) của kiểu bảng),
+       đúng quy ước cả hệ thống — procedure tự đổi sang datetime2. */
+    const t = new sql.Table("SA_CostMonthPeriodList");
+    t.columns.add("MonthNo", sql.Int, { nullable: false });
+    t.columns.add("FromDateTime", sql.VarChar(19), { nullable: false });
+    t.columns.add("ToDateTime", sql.VarChar(19), { nullable: false });
+    for (const p of periods) {
+      const monthNo = parseInteger(p?.monthNo, "monthNo", { min: 1 });
+      if (monthNo > 12) throw new HttpError(400, "Tháng phải từ 1 đến 12.");
+      t.rows.add(
+        monthNo,
+        parseDateTime(p?.fromDateTime, `fromDateTime (tháng ${monthNo})`),
+        parseDateTime(p?.toDateTime, `toDateTime (tháng ${monthNo})`),
+      );
+    }
+
+    const rows = await queryProc("SA_CostMonthPeriod_Save", [
+      ["Year", sql.Int, year],
+      ["Periods", null, t],
+      ["UserName", sql.NVarChar(128), req.user?.username ?? null],
+    ]);
+    res.json(rows);
+  }),
+);
 router.get(
   "/settings",
   wrap(async (_req, res) => res.json(await queryProc("SA_SystemSetting_Get"))),
@@ -985,6 +1044,19 @@ router.put(
    procedure kiểm (RAISERROR tiếng Việt) — endpoint chỉ kiểm định dạng, vì
    procedure là chỗ duy nhất mọi lối ghi đi qua.
    -------------------------------------------------------------------------- */
+
+/**
+ * Tháng gán cho một đợt nhân công, 'YYYY-MM' — CHỈ LÀ NHÃN, không phép tính
+ * nào đọc nó. Bỏ trống thì lưu NULL.
+ */
+function parseCostMonth(value) {
+  const s = value === undefined || value === null ? "" : String(value).trim();
+  if (!s) return null;
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(s)) {
+    throw new HttpError(400, 'Tham số "costMonth" phải có định dạng YYYY-MM.');
+  }
+  return s;
+}
 
 /** Quy tắc đếm ngày làm việc — phải khớp CK_SA_LaborBatch_Rule. */
 function parseWorkDayRule(value) {
@@ -1053,6 +1125,7 @@ router.post(
         sql.Int,
         parseInteger(req.body.id, "id", { required: false, min: 1 }),
       ],
+      ["CostMonth", sql.Char(7), parseCostMonth(req.body.costMonth)],
     ]);
     res.json(rows[0] || null);
   }),

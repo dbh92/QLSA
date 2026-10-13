@@ -13,6 +13,7 @@ import {
   MonthlyCostRow,
   LaborCostState,
   LaborWorkDayRule,
+  CostMonthPeriod,
 } from "../types";
 import {
   formatVND,
@@ -32,6 +33,7 @@ import {
   buildDayColumns,
   buildDeptAllocation,
   reconcileCost,
+  supportCostRecipientCount,
   CostAdjustment,
   applyCostAdjustment,
   previewLossDeduction,
@@ -54,6 +56,7 @@ import { MealCostAllocationReport } from "./financial/MealCostAllocationReport";
 import { YearlyTotalReport } from "./financial/YearlyTotalReport";
 import { ShiftDailyPivotReport } from "./financial/ShiftDailyPivotReport";
 import { LaborCostReport } from "./financial/LaborCostReport";
+import { CostPeriodSettings } from "./financial/CostPeriodSettings";
 import {
   FileSpreadsheet,
   Download,
@@ -281,6 +284,7 @@ interface FinancialReportViewProps {
     effectiveTo: string;
     amount: number;
     notes?: string;
+    costMonth?: string | null;
   }) => Promise<void>;
   onDeleteLaborCost: (id: number) => Promise<void>;
   onApplyLaborCosts: (
@@ -288,6 +292,16 @@ interface FinancialReportViewProps {
     notes?: string,
   ) => Promise<void>;
   onRestoreLaborBatch: (batchId: string) => Promise<void>;
+  /* ---- Kỳ tính chi phí các tháng (bảng 12 tháng) ----------------------
+     Năm của bảng 12 tháng; lưu xong App nạp lại bảng 12 tháng. */
+  costPeriods: CostMonthPeriod[];
+  costPeriodsError: string | null;
+  onSaveCostPeriods: (
+    year: number,
+    periods: { monthNo: number; fromDateTime: string; toDateTime: string }[],
+  ) => Promise<void>;
+  /** Kỳ của một năm bất kỳ — cho ô "Tháng" của màn hình nhân công. */
+  onFetchCostPeriods: (year: number) => Promise<CostMonthPeriod[]>;
   /** Biên lọc chính xác tới giây, "YYYY-MM-DD HH:mm:ss". */
   startDateTime: string;
   endDateTime: string;
@@ -319,6 +333,10 @@ export const FinancialReportView: React.FC<FinancialReportViewProps> = ({
   onDeleteLaborCost,
   onApplyLaborCosts,
   onRestoreLaborBatch,
+  costPeriods,
+  costPeriodsError,
+  onSaveCostPeriods,
+  onFetchCostPeriods,
   startDateTime,
   endDateTime,
   startDate,
@@ -557,12 +575,30 @@ export const FinancialReportView: React.FC<FinancialReportViewProps> = ({
   );
 
   /* Bảng phân bổ theo bộ phận — dựng bằng hàm dùng chung với sheet
-     "Phân bổ theo BP" của file Excel tổng hợp. */
+     "Phân bổ theo BP" của file Excel tổng hợp. Tiền sữa và chi phí nhân công
+     được chia đều cho các bộ phận người Việt ngay trong hàm đó. */
   const deptAllocationData = useMemo(
     () =>
-      buildDeptAllocation(classified, manualMeals, largeDeptOptions, pricing),
-    [classified, manualMeals, largeDeptOptions, pricing],
+      buildDeptAllocation(
+        classified,
+        manualMeals,
+        largeDeptOptions,
+        pricing,
+        milkEntries,
+        laborSegments,
+      ),
+    [
+      classified,
+      manualMeals,
+      largeDeptOptions,
+      pricing,
+      milkEntries,
+      laborSegments,
+    ],
   );
+
+  /** Số bộ phận người Việt cùng gánh tiền sữa / nhân công. */
+  const supportRecipients = supportCostRecipientCount(deptAllocationData);
 
   /* Đơn giá từng loại suất mà bảng phân bổ theo bộ phận đang dùng để tính
      tiền. Suất sinh nhật mỗi ngày một giá nên ô này là giá bình quân của kỳ,
@@ -601,6 +637,16 @@ export const FinancialReportView: React.FC<FinancialReportViewProps> = ({
     [deptAllocationData, milkEntries, extraCosts, laborSegments],
   );
 
+  /* Tổng hai cột chia đều, và phần không chia được — chỉ khác 0 khi danh mục
+     không còn bộ phận người Việt nào. */
+  const allocatedMilk = deptAllocationData.reduce((a, d) => a + d.milkShare, 0);
+  const allocatedLabor = deptAllocationData.reduce(
+    (a, d) => a + d.laborShare,
+    0,
+  );
+  const unallocatedSupport =
+    totals.milkAmount + totals.laborAmount - allocatedMilk - allocatedLabor;
+
   /* Số liệu xu hướng tháng do SA_MealCost_GetMonthly tổng hợp từ log chấm ăn
      thật, theo đúng bộ đơn giá của bảng phân bổ ở trên. Procedure đó cũng loại
      trừ các lượt quẹt đã xóa, nên bảng 12 tháng không còn phải tự trừ lại gì
@@ -616,8 +662,9 @@ export const FinancialReportView: React.FC<FinancialReportViewProps> = ({
         monthlyCosts,
         laborCosts.appliedRows,
         laborWorkDayRule,
+        shifts,
       ),
-    [monthlyCosts, laborCosts.appliedRows, laborWorkDayRule],
+    [monthlyCosts, laborCosts.appliedRows, laborWorkDayRule, shifts],
   );
 
   const monthlyChartData = monthlyCostsWithLabor;
@@ -642,6 +689,7 @@ export const FinancialReportView: React.FC<FinancialReportViewProps> = ({
         rawCosts,
         laborCosts.appliedRows,
         laborWorkDayRule,
+        shifts,
       );
 
       await exportFinancialWorkbook({
@@ -677,6 +725,8 @@ export const FinancialReportView: React.FC<FinancialReportViewProps> = ({
           `${MEAL_CATEGORY_META[c].label} (${Math.round(deptUnitPrices[c])}đ)`,
       ),
       "Tổng Suất Ăn",
+      `Tiền Sữa (chia đều ${supportRecipients} BP)`,
+      `Chi Phí Nhân Công (chia đều ${supportRecipients} BP)`,
       "Tổng Thành Tiền (VNĐ)",
     ];
 
@@ -684,39 +734,42 @@ export const FinancialReportView: React.FC<FinancialReportViewProps> = ({
       d.deptName,
       ...CATEGORY_COLUMNS.map((c) => d.counts[c]),
       d.totalMeals,
-      d.totalAmount,
+      Math.round(d.milkShare),
+      Math.round(d.laborShare),
+      Math.round(d.totalAmount),
     ]);
 
     rows.push([
       "TỔNG CỘNG PHÂN BỔ",
       ...CATEGORY_COLUMNS.map((c) => categoryTotals[c]),
       totals.mealCount,
-      totals.mealAmount,
+      Math.round(allocatedMilk),
+      Math.round(allocatedLabor),
+      Math.round(totals.allocatedAmount),
     ]);
 
-    /* Hai dòng đối chiếu với bảng "Thống kê suất ăn tháng" — xem chú thích
-       ở `reconcileCost`. */
+    /* Dòng đối chiếu với bảng "Thống kê suất ăn tháng" — xem chú thích ở
+       `reconcileCost`. Chỉ chi phí phát sinh là không chia cho bộ phận. */
     const blanks = CATEGORY_COLUMNS.map(() => "");
-    rows.push([
-      "Tiền sữa (không phân bổ theo bộ phận)",
-      ...blanks,
-      totals.milkCount,
-      totals.milkAmount,
-    ]);
     rows.push([
       "Chi phí phát sinh (không phân bổ theo bộ phận)",
       ...blanks,
       totals.extraCount,
+      "",
+      "",
       totals.extraAmount,
     ]);
-    /* Ô "số lượng" của dòng nhân công là NGÀY CÔNG, không phải số suất ăn. */
-    rows.push([
-      "Chi phí nhân công (không phân bổ theo bộ phận)",
-      ...blanks,
-      totals.laborDays,
-      totals.laborAmount,
-    ]);
-    rows.push(["TỔNG THANH TOÁN", ...blanks, "", totals.grandTotal]);
+    if (unallocatedSupport > 0.5) {
+      rows.push([
+        "Sữa + nhân công chưa chia (không có bộ phận người Việt)",
+        ...blanks,
+        "",
+        "",
+        "",
+        Math.round(unallocatedSupport),
+      ]);
+    }
+    rows.push(["TỔNG THANH TOÁN", ...blanks, "", "", "", totals.grandTotal]);
 
     exportToCSV(
       `Bao_Cao_Phan_Bo_Tien_An_${startDate}_${endDate}`,
@@ -992,6 +1045,9 @@ export const FinancialReportView: React.FC<FinancialReportViewProps> = ({
           onDelete={onDeleteLaborCost}
           onApply={onApplyLaborCosts}
           onRestoreBatch={onRestoreLaborBatch}
+          shifts={shifts}
+          costPeriods={costPeriods}
+          onFetchCostPeriods={onFetchCostPeriods}
           startDate={laborRange.from}
           endDate={laborRange.to}
         />
@@ -1073,6 +1129,18 @@ export const FinancialReportView: React.FC<FinancialReportViewProps> = ({
                   <th className="py-3.5 px-4 text-center bg-slate-800">
                     Tổng Suất Ăn
                   </th>
+                  <th className="py-3.5 px-3 text-right bg-cyan-900/60 text-cyan-100">
+                    Tiền Sữa
+                    <div className="font-normal normal-case opacity-80">
+                      chia đều {supportRecipients} BP
+                    </div>
+                  </th>
+                  <th className="py-3.5 px-3 text-right bg-teal-900/60 text-teal-100">
+                    Nhân Công
+                    <div className="font-normal normal-case opacity-80">
+                      chia đều {supportRecipients} BP
+                    </div>
+                  </th>
                   <th className="py-3.5 px-4 text-right bg-emerald-600 text-slate-950 font-extrabold">
                     Thành Tiền (VNĐ)
                   </th>
@@ -1101,6 +1169,20 @@ export const FinancialReportView: React.FC<FinancialReportViewProps> = ({
                     <td className="py-3 px-4 text-center font-bold text-slate-900 bg-slate-50">
                       {d.totalMeals.toLocaleString("vi-VN")}
                     </td>
+                    <td
+                      className={`py-3 px-3 text-right font-mono whitespace-nowrap ${
+                        d.milkShare > 0 ? "text-cyan-700" : "text-slate-400"
+                      }`}
+                    >
+                      {d.milkShare > 0 ? formatVND(d.milkShare) : "-"}
+                    </td>
+                    <td
+                      className={`py-3 px-3 text-right font-mono whitespace-nowrap ${
+                        d.laborShare > 0 ? "text-teal-700" : "text-slate-400"
+                      }`}
+                    >
+                      {d.laborShare > 0 ? formatVND(d.laborShare) : "-"}
+                    </td>
                     <td className="py-3 px-4 text-right font-extrabold text-slate-900 font-mono whitespace-nowrap">
                       {formatVND(d.totalAmount)}
                     </td>
@@ -1121,30 +1203,20 @@ export const FinancialReportView: React.FC<FinancialReportViewProps> = ({
                   <td className="py-4 px-4 text-center font-mono text-amber-400">
                     {totals.mealCount.toLocaleString("vi-VN")}
                   </td>
+                  <td className="py-4 px-3 text-right font-mono text-cyan-300 whitespace-nowrap">
+                    {formatVND(allocatedMilk)}
+                  </td>
+                  <td className="py-4 px-3 text-right font-mono text-teal-300 whitespace-nowrap">
+                    {formatVND(allocatedLabor)}
+                  </td>
                   <td className="py-4 px-4 text-right font-mono text-emerald-400 text-sm whitespace-nowrap">
-                    {formatVND(totals.mealAmount)}
+                    {formatVND(totals.allocatedAmount)}
                   </td>
                 </tr>
 
-                {/* Đối chiếu với bảng "Thống kê suất ăn tháng": bảng này chỉ
-                    có tiền suất ăn, chênh lệch giữa hai bảng đúng bằng tiền
-                    sữa — sữa nhập theo ngày, không có bộ phận thụ hưởng. */}
-                <tr className="bg-slate-100 text-slate-700 normal-case">
-                  <td
-                    className="py-2.5 px-4 font-semibold"
-                    colSpan={CATEGORY_COLUMNS.length + 1}
-                  >
-                    Tiền sữa &mdash; cấp theo ngày, không phân bổ cho bộ phận
-                    nào
-                  </td>
-                  <td className="py-2.5 px-4 text-center font-mono text-slate-600">
-                    {totals.milkCount.toLocaleString("vi-VN")}
-                  </td>
-                  <td className="py-2.5 px-4 text-right font-mono text-cyan-700 text-sm whitespace-nowrap">
-                    {formatVND(totals.milkAmount)}
-                  </td>
-                </tr>
-
+                {/* Đối chiếu với bảng "Thống kê suất ăn tháng": sữa và nhân
+                    công đã chia vào các bộ phận ở hai cột trên, chỉ còn chi
+                    phí phát sinh là không có bộ phận thụ hưởng. */}
                 {(totals.extraCount > 0 || totals.extraAmount > 0) && (
                   <tr className="bg-violet-50 text-violet-900 normal-case">
                     <td
@@ -1157,29 +1229,24 @@ export const FinancialReportView: React.FC<FinancialReportViewProps> = ({
                     <td className="py-2.5 px-4 text-center font-mono">
                       {totals.extraCount.toLocaleString("vi-VN")}
                     </td>
+                    <td colSpan={2} />
                     <td className="py-2.5 px-4 text-right font-mono text-sm whitespace-nowrap">
                       {formatVND(totals.extraAmount)}
                     </td>
                   </tr>
                 )}
 
-                {(totals.laborDays > 0 || totals.laborAmount > 0) && (
-                  <tr className="bg-teal-50 text-teal-900 normal-case">
+                {unallocatedSupport > 0.5 && (
+                  <tr className="bg-red-50 text-red-900 normal-case">
                     <td
                       className="py-2.5 px-4 font-semibold"
-                      colSpan={CATEGORY_COLUMNS.length + 1}
+                      colSpan={CATEGORY_COLUMNS.length + 4}
                     >
-                      Chi phí nhân công &mdash; thuê theo đợt, không phân bổ
-                      cho bộ phận nào
-                    </td>
-                    <td
-                      className="py-2.5 px-4 text-center font-mono"
-                      title="Số ngày công được tính tiền, không phải số suất ăn"
-                    >
-                      {totals.laborDays.toLocaleString("vi-VN")}
+                      Sữa + nhân công chưa chia &mdash; danh mục không có bộ
+                      phận người Việt nào
                     </td>
                     <td className="py-2.5 px-4 text-right font-mono text-sm whitespace-nowrap">
-                      {formatVND(totals.laborAmount)}
+                      {formatVND(unallocatedSupport)}
                     </td>
                   </tr>
                 )}
@@ -1187,7 +1254,7 @@ export const FinancialReportView: React.FC<FinancialReportViewProps> = ({
                 <tr className="bg-amber-100 text-slate-900">
                   <td
                     className="py-3 px-4"
-                    colSpan={CATEGORY_COLUMNS.length + 2}
+                    colSpan={CATEGORY_COLUMNS.length + 4}
                   >
                     TỔNG THANH TOÁN
                     <span className="ml-2 font-normal normal-case text-[11px] text-slate-600">
@@ -1210,18 +1277,33 @@ export const FinancialReportView: React.FC<FinancialReportViewProps> = ({
             Suất Ăn; suất của người Việt vào ngày sinh nhật tập thể tính giá
             suất đặc biệt. Bảng đã gồm cả suất nhập ở tab Nhập Thủ Công Ca, tính
             vào bộ phận thụ hưởng đã ghi khi nhập.{" "}
-            <strong>Dòng TỔNG CỘNG PHÂN BỔ chỉ là tiền suất ăn</strong> — sữa,
-            chi phí phát sinh và chi phí nhân công đều không chia được cho bộ
-            phận nào (sữa và phát sinh cấp theo ngày, nhân công phục vụ cả nhà
-            ăn), nên chúng được cộng riêng ở các dòng dưới. Vì vậy tổng của
-            bảng này luôn nhỏ hơn TOTAL của bảng &ldquo;Thống kê suất ăn
-            tháng&rdquo; đúng bằng ba khoản đó; dòng TỔNG THANH TOÁN là con số
-            khớp giữa hai bảng.
+            <strong>
+              Tiền sữa và chi phí nhân công được chia đều cho{" "}
+              {supportRecipients} bộ phận người Việt
+            </strong>{" "}
+            — không chia cho KR và &ldquo;Khác&rdquo; — rồi cộng vào Thành
+            Tiền của từng bộ phận. Chỉ chi phí phát sinh là không chia được
+            (tên hạng mục tự do, không có bộ phận thụ hưởng), nên nó được cộng
+            riêng ở dòng dưới; tổng của bảng này nhỏ hơn TOTAL của bảng
+            &ldquo;Thống kê suất ăn tháng&rdquo; đúng bằng khoản đó, và dòng
+            TỔNG THANH TOÁN là con số khớp giữa hai bảng.
           </div>
         </div>
       )}
 
       {/* View 2: Yearly Trends & Chart */}
+      {/* Kỳ tính chi phí của từng tháng — luôn hiện ở tab này, kể cả khi bảng
+          12 tháng đang lỗi hay rỗng, vì sửa kỳ có thể chính là cách chữa. */}
+      {reportType === "yearly" && (
+        <CostPeriodSettings
+          year={Number(endDate.slice(0, 4))}
+          periods={costPeriods}
+          error={costPeriodsError}
+          shifts={shifts}
+          onSave={onSaveCostPeriods}
+        />
+      )}
+
       {reportType === "yearly" && monthlyCostsError && (
         <MonthlyCostsProblem
           error={monthlyCostsError}
@@ -1359,6 +1441,19 @@ export const FinancialReportView: React.FC<FinancialReportViewProps> = ({
                       >
                         <td className="py-2.5 px-4 font-bold text-slate-900 whitespace-nowrap">
                           {row.costMonth}
+                          {row.fromDateTime && row.toDateTime && (
+                            <div
+                              className="text-[10px] font-normal font-mono text-slate-500"
+                              title="Kỳ tính chi phí của tháng — nửa mở, mốc cuối không thuộc kỳ"
+                            >
+                              {row.fromDateTime.slice(8, 10)}/
+                              {row.fromDateTime.slice(5, 7)}{" "}
+                              {row.fromDateTime.slice(11, 16)} &rarr;{" "}
+                              {row.toDateTime.slice(8, 10)}/
+                              {row.toDateTime.slice(5, 7)}{" "}
+                              {row.toDateTime.slice(11, 16)}
+                            </div>
+                          )}
                         </td>
                         {TREND_SERIES.map((s) => (
                           <td

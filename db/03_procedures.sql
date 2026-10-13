@@ -34,8 +34,9 @@ SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;
 GO
 
-/* --- Xoá toàn bộ procedure + view cũ của hệ thống suất ăn trước khi tạo lại
-       (view SA_UserDeptResolved cũng do script này sở hữu) ------------------ */
+/* --- Xoá toàn bộ procedure + view + function cũ của hệ thống suất ăn trước
+       khi tạo lại (view SA_UserDeptResolved và hàm SA_CostMonthPeriodOf cũng
+       do script này sở hữu) ------------------------------------------------- */
 DECLARE @drop nvarchar(max) = N'';
 SELECT @drop = @drop + N'DROP PROCEDURE dbo.' + QUOTENAME(name) + N';' + CHAR(10)
 FROM sys.procedures
@@ -43,6 +44,9 @@ WHERE name LIKE 'SA[_]%';
 SELECT @drop = @drop + N'DROP VIEW dbo.' + QUOTENAME(name) + N';' + CHAR(10)
 FROM sys.views
 WHERE name LIKE 'SA[_]%';
+SELECT @drop = @drop + N'DROP FUNCTION dbo.' + QUOTENAME(name) + N';' + CHAR(10)
+FROM sys.objects
+WHERE type IN ('IF', 'FN', 'TF') AND name LIKE 'SA[_]%';
 IF @drop <> N'' EXEC sp_executesql @drop;
 GO
 
@@ -1166,6 +1170,187 @@ END
 GO
 
 /* ===========================================================================
+   SA_CostMonthPeriodOf — KỲ TÍNH CHI PHÍ của 12 tháng trong một năm.
+
+   NGUỒN DUY NHẤT của câu hỏi "tháng M gồm những thời điểm nào": tháng có dòng
+   trong SA_CostMonthPeriod lấy đúng dòng đó, tháng không có dòng lấy kỳ MẶC
+   ĐỊNH = kỳ chốt số của nhà ăn, 25 tháng trước 22:50 -> 25 tháng này 22:50
+   (ngày làm việc 26 -> 25). Tháng được gọi theo tháng KẾT THÚC kỳ: tháng
+   01/2026 = 25/12/2025 22:50 -> 25/01/2026 22:50. 22:50 là giờ bắt đầu của
+   ca vắt qua nửa đêm (SA_Shift.WrapsMidnight), cùng mốc ngày làm việc với
+   mọi bộ lọc ở client.
+
+   Khoảng là NỬA MỞ [FromDateTime, ToDateTime): hai tháng nối tiếp nhau chung
+   một mốc mà không thời điểm nào thuộc về cả hai.
+
+   SA_CostMonthPeriod_Get (màn hình cài đặt) và SA_MealCost_GetMonthly (bảng
+   12 tháng) đều đọc hàm này, nên kỳ người dùng nhìn thấy và kỳ mà tiền được
+   tính theo không thể là hai thứ khác nhau.
+   =========================================================================== */
+CREATE FUNCTION dbo.SA_CostMonthPeriodOf (@Year int)
+RETURNS TABLE
+AS
+RETURN
+    SELECT  m.n                                                         AS MonthNo,
+            CONVERT(char(4), @Year) + '-' + RIGHT('0' + CONVERT(varchar(2), m.n), 2)
+                                                                        AS CostMonth,
+            ISNULL(p.FromDateTime,
+                   DATEADD(SECOND, ws.StartSec,
+                           CAST(DATEADD(MONTH, -1, DATEFROMPARTS(@Year, m.n, 25)) AS datetime2(0))))
+                                                                        AS FromDateTime,
+            ISNULL(p.ToDateTime,
+                   DATEADD(SECOND, ws.StartSec,
+                           CAST(DATEFROMPARTS(@Year, m.n, 25) AS datetime2(0))))
+                                                                        AS ToDateTime,
+            CAST(CASE WHEN p.MonthNo IS NULL THEN 0 ELSE 1 END AS bit)  AS IsCustom
+    FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12)) AS m(n)
+    CROSS JOIN (
+        SELECT DATEDIFF(SECOND, CAST('00:00:00' AS time(0)),
+                        ISNULL((SELECT TOP (1) s.StartTime
+                                FROM dbo.SA_Shift s
+                                WHERE s.WrapsMidnight = 1 AND s.IsActive = 1
+                                ORDER BY s.SortOrder),
+                               CAST('22:50:00' AS time(0)))) AS StartSec
+    ) ws
+    LEFT JOIN dbo.SA_CostMonthPeriod p
+           ON p.CostYear = @Year AND p.MonthNo = m.n;
+GO
+
+/* Kỳ tính chi phí của 12 tháng — cho màn hình cài đặt ở tab Xu hướng năm. */
+CREATE PROCEDURE dbo.SA_CostMonthPeriod_Get
+    @Year int
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF @Year IS NULL OR @Year < 2000 OR @Year > 2999
+    BEGIN
+        RAISERROR (N'Năm không hợp lệ.', 16, 1);
+        RETURN;
+    END
+
+    SELECT  MonthNo                                     AS monthNo,
+            CostMonth                                   AS costMonth,
+            CONVERT(char(19), FromDateTime, 120)        AS fromDateTime,
+            CONVERT(char(19), ToDateTime, 120)          AS toDateTime,
+            IsCustom                                    AS isCustom
+    FROM dbo.SA_CostMonthPeriodOf(@Year)
+    ORDER BY MonthNo;
+END
+GO
+
+/* ===========================================================================
+   SA_CostMonthPeriod_Save — Lưu kỳ tính chi phí của CẢ MỘT NĂM.
+
+   Nhận đúng 12 dòng (thay toàn bộ kỳ của năm) hoặc 0 dòng (xoá hết, cả năm
+   quay về kỳ mặc định). Lưu lẻ một tháng là không được: kỳ tự đặt của tháng
+   này sẽ chồng lên kỳ mặc định của tháng bên cạnh và lượt quẹt nằm ở phần
+   chồng bị tính vào cả hai tháng.
+
+   Kiểm thêm, vì một con số gõ nhầm ở đây đổi cả bảng 12 tháng:
+     - Mỗi kỳ dài không quá 62 ngày, và bắt đầu trong vòng 45 ngày quanh mùng
+       1 của chính tháng đó — gõ nhầm năm thì báo lỗi chứ không lặng lẽ tính.
+     - Hai kỳ bất kỳ trong năm không giao nhau (nửa mở: a.From < b.To AND
+       b.From < a.To). Liền nhau thì được, hở nhau cũng được — khoảng hở chỉ
+       là thời gian không thuộc tháng nào và màn hình cài đặt nói ra điều đó.
+   =========================================================================== */
+CREATE PROCEDURE dbo.SA_CostMonthPeriod_Save
+    @Year     int,
+    @Periods  dbo.SA_CostMonthPeriodList READONLY,
+    @UserName nvarchar(128) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    IF @Year IS NULL OR @Year < 2000 OR @Year > 2999
+    BEGIN
+        RAISERROR (N'Năm không hợp lệ.', 16, 1);
+        RETURN;
+    END
+
+    DECLARE @P TABLE
+    (
+        MonthNo      int          NOT NULL PRIMARY KEY,
+        FromDateTime datetime2(0) NULL,
+        ToDateTime   datetime2(0) NULL
+    );
+    INSERT INTO @P (MonthNo, FromDateTime, ToDateTime)
+    SELECT MonthNo,
+           TRY_CONVERT(datetime2(0), FromDateTime, 120),
+           TRY_CONVERT(datetime2(0), ToDateTime, 120)
+    FROM @Periods;
+
+    DECLARE @n int = (SELECT COUNT(*) FROM @P);
+    IF @n NOT IN (0, 12)
+    BEGIN
+        RAISERROR (N'Phải lưu đủ 12 tháng của năm (hoặc không tháng nào để quay về kỳ mặc định).', 16, 1);
+        RETURN;
+    END
+
+    IF EXISTS (SELECT 1 FROM @P WHERE MonthNo NOT BETWEEN 1 AND 12)
+    BEGIN
+        RAISERROR (N'Tháng phải từ 1 đến 12.', 16, 1);
+        RETURN;
+    END
+
+    DECLARE @bad nvarchar(400);
+
+    SELECT TOP (1) @bad = N'Tháng ' + CONVERT(nvarchar(2), MonthNo)
+                        + N': thời điểm không hợp lệ.'
+    FROM @P
+    WHERE FromDateTime IS NULL OR ToDateTime IS NULL
+    ORDER BY MonthNo;
+    IF @bad IS NOT NULL BEGIN RAISERROR (@bad, 16, 1); RETURN; END
+
+    SELECT TOP (1) @bad = N'Tháng ' + CONVERT(nvarchar(2), MonthNo)
+                        + N': thời điểm kết thúc phải sau thời điểm bắt đầu.'
+    FROM @P
+    WHERE ToDateTime <= FromDateTime
+    ORDER BY MonthNo;
+    IF @bad IS NOT NULL BEGIN RAISERROR (@bad, 16, 1); RETURN; END
+
+    SELECT TOP (1) @bad = N'Tháng ' + CONVERT(nvarchar(2), MonthNo)
+                        + N': một kỳ không được dài quá 62 ngày.'
+    FROM @P
+    WHERE DATEDIFF(SECOND, FromDateTime, ToDateTime) > 62 * 86400
+    ORDER BY MonthNo;
+    IF @bad IS NOT NULL BEGIN RAISERROR (@bad, 16, 1); RETURN; END
+
+    SELECT TOP (1) @bad = N'Tháng ' + CONVERT(nvarchar(2), MonthNo)
+                        + N'/' + CONVERT(nvarchar(4), @Year)
+                        + N': ngày bắt đầu lệch quá xa tháng đó — kiểm tra lại năm.'
+    FROM @P
+    WHERE ABS(DATEDIFF(DAY, DATEFROMPARTS(@Year, MonthNo, 1), FromDateTime)) > 45
+    ORDER BY MonthNo;
+    IF @bad IS NOT NULL BEGIN RAISERROR (@bad, 16, 1); RETURN; END
+
+    SELECT TOP (1) @bad = N'Kỳ của tháng ' + CONVERT(nvarchar(2), a.MonthNo)
+                        + N' và tháng ' + CONVERT(nvarchar(2), b.MonthNo)
+                        + N' chồng lên nhau — một lượt quẹt sẽ bị tính vào cả hai tháng.'
+    FROM @P a
+    INNER JOIN @P b
+            ON b.MonthNo > a.MonthNo
+           AND a.FromDateTime < b.ToDateTime
+           AND b.FromDateTime < a.ToDateTime
+    ORDER BY a.MonthNo, b.MonthNo;
+    IF @bad IS NOT NULL BEGIN RAISERROR (@bad, 16, 1); RETURN; END
+
+    BEGIN TRANSACTION;
+
+    DELETE FROM dbo.SA_CostMonthPeriod WHERE CostYear = @Year;
+
+    INSERT INTO dbo.SA_CostMonthPeriod (CostYear, MonthNo, FromDateTime, ToDateTime, UpdatedBy)
+    SELECT @Year, MonthNo, FromDateTime, ToDateTime, @UserName
+    FROM @P;
+
+    COMMIT TRANSACTION;
+
+    EXEC dbo.SA_CostMonthPeriod_Get @Year = @Year;
+END
+GO
+
+/* ===========================================================================
    SA_MealCost_GetMonthly — Chi phí suất ăn theo TỪNG THÁNG của một năm.
 
    Dùng cho biểu đồ "Xu Hướng Năm". Phải tổng hợp tại SQL Server vì một năm
@@ -1196,6 +1381,22 @@ GO
    nào bỏ trống giá. Bản song song ở client: classifyLogs /
    classifyManualEntries — sửa một nơi thì phải sửa cả nơi kia.
    Tháng không có dữ liệu vẫn trả về một dòng với giá trị 0.
+
+   THÁNG LÀ MỘT KỲ, KHÔNG PHẢI THÁNG LỊCH. Mỗi tháng là khoảng nửa mở
+   [FromDateTime, ToDateTime) của dbo.SA_CostMonthPeriodOf — người dùng đặt ở
+   tab Xu hướng năm, mặc định là kỳ 25 tháng trước 22:50 -> 25 tháng này
+   22:50 (tháng 01/2026 = 25/12/2025 22:50 -> 25/01/2026 22:50). Mọi khoản
+   được xếp vào tháng theo MỘT MỐC THỜI ĐIỂM rơi vào kỳ nào:
+     - lượt quẹt: chính thời điểm quẹt;
+     - suất nhập tay: giờ bắt đầu ca trong ngày làm việc đã nhập (ca vắt nửa
+       đêm bắt đầu từ tối hôm trước) — bản song song `manualEntryDateTime`;
+     - sữa / chi phí phát sinh: giờ BẮT ĐẦU khung cấp phát — ca đêm của ngày
+       D từ (D-1) 22:50, ca ngày từ D 08:00 — bản song song
+       `supplyShiftWindow`.
+   Hai kỳ trong một năm không giao nhau (SA_CostMonthPeriod_Save kiểm), và
+   mỗi khoản lấy TOP (1) kỳ chứa nó, nên không khoản nào bị tính hai lần.
+   Kỳ của từng tháng cũng được trả về (fromDateTime / toDateTime) để client
+   cắt chi phí nhân công theo đúng hai mốc đó.
    =========================================================================== */
 CREATE PROCEDURE dbo.SA_MealCost_GetMonthly
     @Year int = NULL
@@ -1211,14 +1412,34 @@ BEGIN
         RETURN;
     END
 
-    /* Ngày của lượt quẹt là ngày lịch — xem chú thích ở SA_MealLog_GetByRange. */
-    DECLARE @FromDate date = DATEFROMPARTS(@Year, 1, 1);
-    DECLARE @ToDate   date = DATEFROMPARTS(@Year, 12, 31);
+    /* --- 12 kỳ của năm, để tháng rỗng vẫn có dòng ------------------------ */
+    CREATE TABLE #Months
+    (
+        MonthNo   int          NOT NULL PRIMARY KEY,
+        CostMonth char(7)      NOT NULL,
+        FromTime  datetime2(0) NOT NULL,
+        ToTime    datetime2(0) NOT NULL
+    );
+    INSERT INTO #Months (MonthNo, CostMonth, FromTime, ToTime)
+    SELECT MonthNo, CostMonth, FromDateTime, ToDateTime
+    FROM dbo.SA_CostMonthPeriodOf(@Year);
 
+    /* Biên epoch phủ trọn 12 kỳ để vẫn seek được clustered PK của
+       TB_EVENT_LOG — xem chú thích ở SA_MealLog_GetByRange. */
     DECLARE @FromEpoch int =
-        DATEDIFF(SECOND, '1970-01-01', CAST(@FromDate AS datetime2(0)));
+        DATEDIFF(SECOND, '1970-01-01', (SELECT MIN(FromTime) FROM #Months));
     DECLARE @ToEpoch   int =
-        DATEDIFF(SECOND, '1970-01-01', CAST(DATEADD(DAY, 1, @ToDate) AS datetime2(0))) - 1;
+        DATEDIFF(SECOND, '1970-01-01', (SELECT MAX(ToTime) FROM #Months)) - 1;
+
+    /* Giờ bắt đầu ngày làm việc (ca vắt nửa đêm) — mốc của khung cấp phát
+       ca đêm. Cùng nguồn với SA_CostMonthPeriodOf. */
+    DECLARE @NightStart time(0) =
+        ISNULL((SELECT TOP (1) StartTime FROM dbo.SA_Shift
+                WHERE WrapsMidnight = 1 AND IsActive = 1 ORDER BY SortOrder),
+               CAST('22:50:00' AS time(0)));
+    DECLARE @NightStartSec int = DATEDIFF(SECOND, CAST('00:00:00' AS time(0)), @NightStart);
+    /* = SUPPLY_DAY_START ở client. */
+    DECLARE @SupplyDayStartSec int = 8 * 3600;
 
     /* --- Ca được ăn suất sinh nhật ---------------------------------------
        Chuỗi 'CA1,CA4'. Bọc dấu phẩy hai đầu để so khớp nguyên vẹn mã ca,
@@ -1238,12 +1459,6 @@ BEGIN
     /* Chỉ là giá DỰ PHÒNG cho ngày sinh nhật nào bỏ trống giá — không còn là
        đơn giá suất sinh nhật của cả kỳ. Xem chú thích đầu procedure. */
     DECLARE @pDacBiet    decimal(18,2) = ISNULL((SELECT UnitPrice FROM dbo.SA_MealPrice WHERE Code = 'SUAT_DAC_BIET' AND IsActive = 1), 50000);
-
-    /* --- 12 tháng của năm, để tháng rỗng vẫn có dòng --------------------- */
-    CREATE TABLE #Months (MonthNo int NOT NULL PRIMARY KEY, CostMonth char(7) NOT NULL);
-    INSERT INTO #Months (MonthNo, CostMonth)
-    SELECT n, CONVERT(char(4), @Year) + '-' + RIGHT('0' + CONVERT(varchar(2), n), 2)
-    FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12)) AS m(n);
 
     /* --- Nhân viên + bộ phận lớn đã giải quy tắc ------------------------- */
     CREATE TABLE #Users
@@ -1302,7 +1517,7 @@ BEGIN
             SUM(CASE WHEN c.Category = 'VN_SINHNHAT'
                      THEN c.Qty * c.BirthdayPrice ELSE 0 END)
     FROM (
-        SELECT  MONTH(a.ActualDate) AS MonthNo,
+        SELECT  pm.MonthNo          AS MonthNo,
                 1                   AS Qty,
                 CASE
                     WHEN st.StaffType = 'KR' THEN cat.BaseCategory
@@ -1327,6 +1542,13 @@ BEGIN
         CROSS APPLY (
             SELECT CAST(t.LogTime AS date) AS ActualDate
         ) a
+        CROSS APPLY (
+            /* KỲ chứa lượt quẹt — ngoài mọi kỳ của năm thì không tính. */
+            SELECT TOP (1) km.MonthNo
+            FROM #Months km
+            WHERE t.LogTime >= km.FromTime AND t.LogTime < km.ToTime
+            ORDER BY km.MonthNo
+        ) pm
         OUTER APPLY (
             SELECT TOP (1) s.ShiftCode, s.WrapsMidnight, s.EndTime
             FROM dbo.SA_Shift s
@@ -1386,7 +1608,6 @@ BEGIN
         ) cat
         LEFT JOIN dbo.SA_BirthdayConfig bd ON bd.ConfigDate = md.MealDate
         WHERE e.nDateTime BETWEEN @FromEpoch AND @ToEpoch
-          AND YEAR(a.ActualDate) = @Year
           /* Cùng bộ lọc với SA_MealLog_GetByRange — nếu chỉ một trong hai
              procedure lọc thì bảng 12 tháng và các bảng kê sẽ đá nhau. Loại
              CẢ lượt xoá 'MAT_MAT': procedure kia trả chúng về chỉ để tab Suất
@@ -1411,7 +1632,7 @@ BEGIN
            nửa đêm là EntryDate - 1 (`mmd`). Người Hàn không bao giờ bị đè.
            Phía client `classifyManualEntries` làm y hệt — đổi một bên thì
            phải đổi bên kia. */
-        SELECT  MONTH(me.EntryDate) AS MonthNo,
+        SELECT  mpm.MonthNo         AS MonthNo,
                 me.Quantity         AS Qty,
                 CASE WHEN me.StaffType <> 'KR'
                       AND mbd.ConfigDate IS NOT NULL
@@ -1434,6 +1655,25 @@ BEGIN
                         ELSE me.EntryDate
                    END AS MealDate
         ) mmd
+        CROSS APPLY (
+            /* MỐC THỜI ĐIỂM của dòng nhập tay = giờ bắt đầu ca trong ngày làm
+               việc đã nhập; ca vắt nửa đêm bắt đầu từ tối hôm trước. Ca 'Khác'
+               không có trong SA_Shift nên lấy đầu ngày. Bản song song:
+               `manualEntryDateTime` ở client. */
+            SELECT DATEADD(SECOND,
+                           DATEDIFF(SECOND, CAST('00:00:00' AS time(0)),
+                                    ISNULL(msh.StartTime, CAST('00:00:00' AS time(0)))),
+                           CAST(CASE WHEN msh.WrapsMidnight = 1
+                                     THEN DATEADD(DAY, -1, me.EntryDate)
+                                     ELSE me.EntryDate
+                                END AS datetime2(0))) AS EntryTime
+        ) mt
+        CROSS APPLY (
+            SELECT TOP (1) km.MonthNo
+            FROM #Months km
+            WHERE mt.EntryTime >= km.FromTime AND mt.EntryTime < km.ToTime
+            ORDER BY km.MonthNo
+        ) mpm
         LEFT JOIN dbo.SA_BirthdayConfig mbd ON mbd.ConfigDate = mmd.MealDate
         CROSS APPLY (
             SELECT ISNULL(msmc.MealCategory,
@@ -1444,26 +1684,57 @@ BEGIN
                                          THEN 'VN_CHINH' ELSE 'VN_PHU' END
                           END) AS BaseCategory
         ) mcat
-        WHERE YEAR(me.EntryDate) = @Year
-          AND me.Quantity > 0
+        WHERE me.Quantity > 0
+          /* Chỉ để dùng index theo ngày; kỳ nào chứa dòng này do `mpm` quyết. */
+          AND me.EntryDate >= DATEADD(DAY, -1, CAST((SELECT MIN(FromTime) FROM #Months) AS date))
+          AND me.EntryDate <= DATEADD(DAY,  1, CAST((SELECT MAX(ToTime)   FROM #Months) AS date))
     ) c
     GROUP BY c.MonthNo;
 
-    /* --- Tiền sữa theo tháng --------------------------------------------- */
+    /* --- Sữa / chi phí phát sinh theo kỳ ---------------------------------
+       Một dòng cấp phát thuộc kỳ chứa giờ BẮT ĐẦU khung của nó: ca đêm ngày
+       D bắt đầu (D-1) 22:50, ca ngày D bắt đầu D 08:00 — xem
+       `supplyShiftWindow`. Với kỳ chốt ở 22:50, khung nào cũng nằm trọn
+       trong đúng một kỳ. */
     CREATE TABLE #MilkCost (MonthNo int NOT NULL PRIMARY KEY, Amount decimal(18,2) NOT NULL);
     INSERT INTO #MilkCost (MonthNo, Amount)
-    SELECT MONTH(EntryDate), SUM(TotalAmount)
-    FROM dbo.SA_MilkEntry
-    WHERE YEAR(EntryDate) = @Year
-    GROUP BY MONTH(EntryDate);
+    SELECT km.MonthNo, SUM(x.TotalAmount)
+    FROM dbo.SA_MilkEntry x
+    CROSS APPLY (
+        SELECT CASE WHEN x.MilkShift = 'DEM'
+                    THEN DATEADD(SECOND, @NightStartSec,
+                                 CAST(DATEADD(DAY, -1, x.EntryDate) AS datetime2(0)))
+                    ELSE DATEADD(SECOND, @SupplyDayStartSec,
+                                 CAST(x.EntryDate AS datetime2(0)))
+               END AS WindowStart
+    ) w
+    CROSS APPLY (
+        SELECT TOP (1) k.MonthNo
+        FROM #Months k
+        WHERE w.WindowStart >= k.FromTime AND w.WindowStart < k.ToTime
+        ORDER BY k.MonthNo
+    ) km
+    GROUP BY km.MonthNo;
 
-    /* --- Chi phí phát sinh theo tháng ------------------------------------- */
     CREATE TABLE #ExtraCost (MonthNo int NOT NULL PRIMARY KEY, Amount decimal(18,2) NOT NULL);
     INSERT INTO #ExtraCost (MonthNo, Amount)
-    SELECT MONTH(EntryDate), SUM(TotalAmount)
-    FROM dbo.SA_ExtraCost
-    WHERE YEAR(EntryDate) = @Year
-    GROUP BY MONTH(EntryDate);
+    SELECT km.MonthNo, SUM(x.TotalAmount)
+    FROM dbo.SA_ExtraCost x
+    CROSS APPLY (
+        SELECT CASE WHEN x.CostShift = 'DEM'
+                    THEN DATEADD(SECOND, @NightStartSec,
+                                 CAST(DATEADD(DAY, -1, x.EntryDate) AS datetime2(0)))
+                    ELSE DATEADD(SECOND, @SupplyDayStartSec,
+                                 CAST(x.EntryDate AS datetime2(0)))
+               END AS WindowStart
+    ) w
+    CROSS APPLY (
+        SELECT TOP (1) k.MonthNo
+        FROM #Months k
+        WHERE w.WindowStart >= k.FromTime AND w.WindowStart < k.ToTime
+        ORDER BY k.MonthNo
+    ) km
+    GROUP BY km.MonthNo;
 
     /* --- Kết quả: số suất + thành tiền từng loại ------------------------- */
     SELECT
@@ -1490,7 +1761,10 @@ BEGIN
            + ISNULL(mc.ComVietPhu, 0)  * @pComVietPhu
            + ISNULL(mc.SuatDacBietAmount, 0)
            + ISNULL(mk.Amount, 0)
-           + ISNULL(ex.Amount, 0)                     AS float)         AS [Sum]
+           + ISNULL(ex.Amount, 0)                     AS float)         AS [Sum],
+        /* Kỳ của tháng — client cắt chi phí nhân công theo đúng hai mốc này. */
+        CONVERT(char(19), mo.FromTime, 120)                             AS fromDateTime,
+        CONVERT(char(19), mo.ToTime, 120)                               AS toDateTime
     FROM #Months mo
     LEFT JOIN #MealCount mc ON mc.MonthNo = mo.MonthNo
     LEFT JOIN #MilkCost  mk ON mk.MonthNo = mo.MonthNo
@@ -1958,6 +2232,7 @@ BEGIN
             CONVERT(char(10), d.EffectiveTo,   23) AS effectiveTo,
             CONVERT(float, d.Amount)             AS amount,
             d.Notes                              AS notes,
+            d.CostMonth                          AS costMonth,
             CONVERT(char(19), d.UpdatedAt, 120)  AS updatedAt
     FROM dbo.SA_LaborCost d
     ORDER BY d.WorkerName, d.EffectiveFrom, d.LaborId;
@@ -1984,7 +2259,8 @@ BEGIN
             CONVERT(char(10), a.EffectiveFrom, 23) AS effectiveFrom,
             CONVERT(char(10), a.EffectiveTo,   23) AS effectiveTo,
             CONVERT(float, a.Amount)             AS amount,
-            a.Notes                              AS notes
+            a.Notes                              AS notes,
+            a.CostMonth                          AS costMonth
     FROM dbo.SA_LaborCostApplied a
     WHERE a.BatchId = (SELECT TOP (1) b.BatchId
                        FROM dbo.SA_LaborCostBatch b
@@ -2014,7 +2290,10 @@ CREATE PROCEDURE dbo.SA_LaborCost_Save
     @Notes         nvarchar(255) = NULL,
     /* Bỏ trống = THÊM một đợt mới; truyền vào = sửa đúng đợt đó, và chính nó
        không bị tính là trùng với chính nó. */
-    @LaborId       int           = NULL
+    @LaborId       int           = NULL,
+    /* 'YYYY-MM' — tháng người dùng gán cho đợt. Chỉ là NHÃN: tiền vẫn chia
+       theo ngày làm việc của khoảng ngày, không theo tháng này. */
+    @CostMonth     char(7)       = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -2074,8 +2353,8 @@ BEGIN
 
     IF @LaborId IS NULL
     BEGIN
-        INSERT INTO dbo.SA_LaborCost (WorkerName, EffectiveFrom, EffectiveTo, Amount, Notes)
-        VALUES (@WorkerName, @EffectiveFrom, @EffectiveTo, @Amount, @Notes);
+        INSERT INTO dbo.SA_LaborCost (WorkerName, EffectiveFrom, EffectiveTo, Amount, Notes, CostMonth)
+        VALUES (@WorkerName, @EffectiveFrom, @EffectiveTo, @Amount, @Notes, @CostMonth);
 
         SET @LaborId = CAST(SCOPE_IDENTITY() AS int);
     END
@@ -2087,6 +2366,7 @@ BEGIN
                EffectiveTo   = @EffectiveTo,
                Amount        = @Amount,
                Notes         = @Notes,
+               CostMonth     = @CostMonth,
                UpdatedAt     = SYSDATETIME()
          WHERE LaborId = @LaborId;
 
@@ -2186,8 +2466,8 @@ BEGIN
         FROM dbo.SA_LaborCost d;
 
         INSERT INTO dbo.SA_LaborCostApplied
-            (BatchId, WorkerName, EffectiveFrom, EffectiveTo, Amount, Notes)
-        SELECT @BatchId, d.WorkerName, d.EffectiveFrom, d.EffectiveTo, d.Amount, d.Notes
+            (BatchId, WorkerName, EffectiveFrom, EffectiveTo, Amount, Notes, CostMonth)
+        SELECT @BatchId, d.WorkerName, d.EffectiveFrom, d.EffectiveTo, d.Amount, d.Notes, d.CostMonth
         FROM dbo.SA_LaborCost d;
 
         COMMIT TRANSACTION;
@@ -2224,7 +2504,8 @@ BEGIN
             CONVERT(char(10), a.EffectiveFrom, 23) AS effectiveFrom,
             CONVERT(char(10), a.EffectiveTo,   23) AS effectiveTo,
             CONVERT(float, a.Amount)             AS amount,
-            a.Notes                              AS notes
+            a.Notes                              AS notes,
+            a.CostMonth                          AS costMonth
     FROM dbo.SA_LaborCostApplied a
     WHERE a.BatchId = @BatchId
     ORDER BY a.WorkerName, a.EffectiveFrom, a.AppliedId;
@@ -2253,8 +2534,8 @@ BEGIN
 
         DELETE FROM dbo.SA_LaborCost;
 
-        INSERT INTO dbo.SA_LaborCost (WorkerName, EffectiveFrom, EffectiveTo, Amount, Notes)
-        SELECT a.WorkerName, a.EffectiveFrom, a.EffectiveTo, a.Amount, a.Notes
+        INSERT INTO dbo.SA_LaborCost (WorkerName, EffectiveFrom, EffectiveTo, Amount, Notes, CostMonth)
+        SELECT a.WorkerName, a.EffectiveFrom, a.EffectiveTo, a.Amount, a.Notes, a.CostMonth
         FROM dbo.SA_LaborCostApplied a
         WHERE a.BatchId = @BatchId;
 

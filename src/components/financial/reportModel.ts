@@ -21,6 +21,7 @@ import {
   SupplyShiftCode,
   MonthlyCostRow,
   LaborWorkDayRule,
+  CostMonthPeriod,
 } from "../../types";
 import {
   CountedManualMeal,
@@ -34,12 +35,14 @@ import {
   SUPPLY_SHIFT_ORDER,
   addDays,
   classifyMeal,
+  costWorkDayRange,
   getCostReportDate,
   getLogLargeDepartment,
   getMealShiftDate,
   isBirthdayMealLog,
   reportShiftLabel,
   supplyInRange,
+  workDayStartTime,
 } from "../../services/mealEngine";
 
 /** Thứ tự ca cố định của mọi bảng kê: CA1 (ca đêm) trước, rồi xuôi trong ngày. */
@@ -756,21 +759,24 @@ export function buildSupplySeries(entries: SupplyEntryLike[]): SupplySeries[] {
    Đợt nằm trọn trong khoảng lọc thì phần giao = cả đợt, hai vế triệt tiêu và
    ra đúng số tiền đã nhập — không có sai số làm tròn nào chen vào.
 
-   KHOẢNG NGÀY LÀ NỬA MỞ [from, to): ngày bắt đầu ĐƯỢC tính, ngày kết thúc
-   KHÔNG. Đó là điều kiện để hai đợt viết liền nhau như người dùng vẫn viết
-   trên giấy — 25/07→25/08 rồi 25/08→25/09 — mà ngày 25/08 thuộc về đúng một
-   đợt: không tính hai lần, cũng không rơi mất. Mọi biên trong khối này đều
-   theo quy ước đó, kể cả biên của khoảng lọc: `endDate` của bộ lọc là ngày
-   CÓ tính, nên nó được cộng thêm một ngày để thành biên nửa mở.
+   KHOẢNG NGÀY LÀ NỬA MỞ [from, to) TRÊN TRỤC NGÀY LÀM VIỆC: ngày làm việc D
+   chạy (D-1) 22:50 -> D 22:50, nên đợt lưu 26/07 -> 26/08 là đúng khoảng
+   thời gian 25/07 22:50 -> 25/08 22:50 và gồm các ngày làm việc 26/07..25/08.
+   Màn hình nhân công nhập và hiển thị hai mốc 22:50 đó
+   (`laborBoundaryDateTime`), cơ sở dữ liệu giữ ngày làm việc. Nửa mở là điều
+   kiện để hai đợt viết liền nhau — 25/07 22:50→25/08 22:50 rồi 25/08 22:50→
+   25/09 22:50 — mà không ngày làm việc nào bị tính hai lần hay rơi mất. Mọi
+   biên trong khối này đều theo quy ước đó, kể cả biên của khoảng lọc:
+   `endDate` của bộ lọc là ngày CÓ tính, nên nó được cộng thêm một ngày để
+   thành biên nửa mở.
 
    ĐÂY LÀ BẢN CÀI ĐẶT DUY NHẤT của phép chia đó. Bảng kê tháng, bảng phân bổ
    tiền ăn, bảng phân bổ theo bộ phận, bảng 12 tháng và mọi sheet Excel đều
    gọi vào đây — không nơi nào tự tính lại, nên không nơi nào lệch được.
 
-   Chi phí nhân công KHÔNG phân bổ cho bộ phận nào (không có bộ phận thụ hưởng
-   nào để gánh, giống hệt sữa và chi phí phát sinh) nên nó nằm trong
-   `reconcileCost` chứ không trong `buildDeptAllocation`. Và nó chỉ có mặt
-   trong tab Báo Cáo Chi Phí — không màn hình nào khác đọc khối này.
+   Ở bảng "Phân bổ theo BP", chi phí nhân công được CHIA ĐỀU cho các bộ phận
+   người Việt, cùng cách với tiền sữa (`buildDeptAllocation`). Và nó chỉ có
+   mặt trong tab Báo Cáo Chi Phí — không màn hình nào khác đọc khối này.
    ------------------------------------------------------------------------- */
 
 /** Nhãn tiếng Việt của từng quy tắc đếm ngày làm việc. */
@@ -846,6 +852,47 @@ export function countLaborWorkDays(
     if (allowed.includes(weekdayOfDayNumber(a + i))) count += 1;
   }
   return count;
+}
+
+/**
+ * Biên NGÀY LÀM VIỆC của đợt -> mốc THỜI ĐIỂM mà người dùng nhìn thấy.
+ *
+ * Ngày làm việc D bắt đầu lúc (D-1) 22:50, nên biên "D" của một đợt chính là
+ * thời điểm (D-1) 22:50: đợt lưu 26/07 -> 26/08 hiển thị 25/07 22:50 ->
+ * 25/08 22:50. 22:50 là giờ bắt đầu ca vắt nửa đêm (`workDayStartTime`).
+ */
+export function laborBoundaryDateTime(
+  workDay: string,
+  shifts?: ShiftInfo[],
+): string {
+  return `${addDays(workDay, -1)} ${workDayStartTime(shifts).slice(0, 5)}`;
+}
+
+/**
+ * Ngược của `laborBoundaryDateTime`: người dùng chọn NGÀY của mốc 22:50,
+ * cơ sở dữ liệu lưu ngày làm việc bắt đầu từ mốc đó, tức ngày hôm sau.
+ */
+export const laborWorkDayFromBoundary = (boundaryDate: string) =>
+  addDays(boundaryDate, 1);
+
+/** Ngược lại nữa: biên ngày làm việc -> NGÀY của mốc 22:50 cho ô nhập. */
+export const laborBoundaryDate = (workDay: string) => addDays(workDay, -1);
+
+/**
+ * Đợt thuê (nửa mở, theo ngày làm việc) phủ TRỌN kỳ của một tháng.
+ *
+ * Ô "Tháng" của màn hình nhân công gọi hàm này để tự điền hai mốc: tháng
+ * 01/2026 = kỳ 25/12/2025 22:50 -> 25/01/2026 22:50 chạm các ngày làm việc
+ * 26/12/2025..25/01/2026, nên đợt là [26/12/2025, 26/01/2026). Đợt đó cắt theo cùng kỳ ở bảng 12 tháng (`withLaborCost`)
+ * thì trùng khít và ra đúng số tiền đã nhập.
+ */
+export function laborRangeForPeriod(
+  period: Pick<CostMonthPeriod, "fromDateTime" | "toDateTime">,
+  shifts?: ShiftInfo[],
+): { effectiveFrom: string; effectiveTo: string } | null {
+  const r = costWorkDayRange(period.fromDateTime, period.toDateTime, shifts);
+  if (r.to < r.from) return null;
+  return { effectiveFrom: r.from, effectiveTo: addDays(r.to, 1) };
 }
 
 /** Một đợt thuê nhân công đã áp dụng, rút gọn về đúng cái phép chia cần. */
@@ -1706,10 +1753,33 @@ export const CATEGORY_COLUMNS: MealCategory[] = [
   "VN_SINHNHAT",
 ];
 
+/**
+ * Bộ phận lớn KHÔNG gánh tiền sữa và chi phí nhân công.
+ *
+ * Sữa và nhân công phục vụ người Việt ở nhà ăn, nên hai khoản đó được CHIA
+ * ĐỀU cho các bộ phận người Việt — mọi bộ phận lớn trừ KR (người Hàn) và
+ * 'Khác' (người chưa ánh xạ, không có ai để gửi hoá đơn).
+ */
+export const SHARED_COST_EXCLUDED_DEPTS = ["KR", "Khác"];
+
+/** Bộ phận này có nhận một phần tiền sữa / nhân công không. */
+export const sharesSupportCost = (deptName: string) =>
+  !SHARED_COST_EXCLUDED_DEPTS.includes(deptName);
+
 export interface DeptAllocationRow {
   deptName: string;
   counts: Record<MealCategory, number>;
   totalMeals: number;
+  /** Tiền suất ăn của bộ phận = Σ số suất × đơn giá cột. */
+  mealAmount: number;
+  /**
+   * Phần tiền sữa chia đều cho bộ phận — 0 với KR và 'Khác'. KHÔNG làm tròn:
+   * cộng các phần lại phải ra đúng tổng tiền sữa.
+   */
+  milkShare: number;
+  /** Phần chi phí nhân công chia đều — cùng quy tắc với `milkShare`. */
+  laborShare: number;
+  /** = mealAmount + milkShare + laborShare. */
   totalAmount: number;
 }
 
@@ -1754,6 +1824,10 @@ export function buildDeptAllocation(
   manualMeals: CountedManualMeal[],
   largeDeptOptions: string[],
   pricing: MealPricing,
+  /* ĐÃ LỌC theo khoảng lọc — `filterSupplyByRange`. */
+  milkEntries: DailyMilkEntry[] = [],
+  /* Đã cắt sẵn theo khoảng lọc — `buildLaborSegments`. */
+  laborSegments: LaborSegment[] = [],
 ): DeptAllocationRow[] {
   const byDept = new Map<string, Record<MealCategory, number>>();
   const bump = (largeDept: string, category: MealCategory, qty: number) => {
@@ -1774,19 +1848,47 @@ export function buildDeptAllocation(
   ];
 
   /* Đúng bộ đơn giá mà bảng in ra ở hàng tiêu đề, nên "số suất × đơn giá của
-     cột" cộng lại đúng bằng ô Thành Tiền của dòng. */
+     cột" cộng lại đúng bằng ô tiền suất ăn của dòng. */
   const unitPrices = buildCategoryUnitPrices(classified, manualMeals, pricing);
+
+  /* Sữa và nhân công chia ĐỀU cho các bộ phận người Việt, kể cả bộ phận kỳ
+     này không có suất nào: hai khoản này không đi theo số suất. Tổng lấy từ
+     đúng các hàm mà `reconcileCost` và bảng kê tháng dùng, nên tổng các phần
+     luôn bằng con số ở hai chỗ đó. */
+  const recipients = deptNames.filter(sharesSupportCost);
+  const milkAmount = supplyTotals(
+    buildSupplySeries(milkEntries.map(milkAsSupply)),
+  ).amount;
+  const laborAmount = laborTotalAmount(laborSegments);
+  const milkShare = recipients.length > 0 ? milkAmount / recipients.length : 0;
+  const laborShare =
+    recipients.length > 0 ? laborAmount / recipients.length : 0;
 
   return deptNames.map((deptName) => {
     const counts = byDept.get(deptName) ?? emptyCategoryCounts();
     const totalMeals = CATEGORY_COLUMNS.reduce((sum, c) => sum + counts[c], 0);
-    const totalAmount = CATEGORY_COLUMNS.reduce(
+    const mealAmount = CATEGORY_COLUMNS.reduce(
       (sum, c) => sum + counts[c] * unitPrices[c],
       0,
     );
-    return { deptName, counts, totalMeals, totalAmount };
+    const shares = sharesSupportCost(deptName);
+    const milk = shares ? milkShare : 0;
+    const labor = shares ? laborShare : 0;
+    return {
+      deptName,
+      counts,
+      totalMeals,
+      mealAmount,
+      milkShare: milk,
+      laborShare: labor,
+      totalAmount: mealAmount + milk + labor,
+    };
   });
 }
+
+/** Số bộ phận nhận một phần tiền sữa / nhân công — mẫu số của phép chia. */
+export const supportCostRecipientCount = (rows: DeptAllocationRow[]) =>
+  rows.filter((d) => sharesSupportCost(d.deptName)).length;
 
 /* -------------------------------------------------------------------------
    Đối chiếu tổng tiền giữa các bảng
@@ -1794,34 +1896,47 @@ export function buildDeptAllocation(
    Hai bảng trả lời hai câu hỏi khác nhau và VÌ THẾ có hai con số khác nhau:
 
    - "Thống kê suất ăn tháng" là bảng kê gửi nhà ăn, TOTAL của nó là số tiền
-     phải trả — gồm cả tiền sữa.
-   - "Phân bổ theo BP" chia tiền cho các bộ phận, nên chỉ có tiền SUẤT ĂN:
-     sữa và các hạng mục phát sinh nhập theo ngày, không có bộ phận thụ hưởng
-     nào để gánh.
+     phải trả — gồm suất ăn, sữa, chi phí phát sinh và nhân công.
+   - "Phân bổ theo BP" chia tiền cho các bộ phận: tiền suất ăn theo số suất
+     của từng bộ phận, tiền sữa và nhân công CHIA ĐỀU cho các bộ phận người
+     Việt (`buildDeptAllocation`). Chỉ chi phí phát sinh là không chia — tên
+     hạng mục là chữ tự do, không có quy tắc nào nói bộ phận nào gánh.
 
-   Chênh lệch giữa hai bảng luôn đúng bằng tiền sữa cộng tiền phát sinh.
-   Trước đây không bảng nào nói ra điều đó nên người đọc tưởng số liệu sai.
+   Chênh lệch giữa TỔNG CỘNG PHÂN BỔ và TOTAL luôn đúng bằng tiền phát sinh.
    Hàm này là nguồn duy nhất của các con số, và bảng phân bổ in hết ra để đối
    chiếu thấy ngay. */
 
+/** Tổng tiền và tổng số lượng của các dòng cấp phát. */
+function supplyTotals(rows: SupplySeries[]) {
+  return {
+    amount: rows.reduce((acc, m) => acc + m.amount, 0),
+    count: rows.reduce((acc, m) => acc + m.series.total, 0),
+  };
+}
+
 export interface CostReconciliation {
-  /** Tiền suất ăn — đúng bằng tổng của bảng phân bổ theo bộ phận. */
+  /** Tiền SUẤT ĂN của mọi bộ phận (chưa gồm phần sữa / nhân công). */
   mealAmount: number;
   mealCount: number;
-  /** Tiền sữa — không phân bổ cho bộ phận nào. */
+  /** Tiền sữa — chia đều cho các bộ phận người Việt. */
   milkAmount: number;
   milkCount: number;
-  /** Tiền các hạng mục phát sinh — cũng không phân bổ cho bộ phận nào. */
+  /** Tiền các hạng mục phát sinh — KHÔNG phân bổ cho bộ phận nào. */
   extraAmount: number;
   extraCount: number;
   /**
    * Tiền thuê nhân công của lượt "Áp dụng" đang có hiệu lực, đã cắt theo
-   * khoảng lọc. Cũng không phân bổ cho bộ phận nào: nhân công phục vụ cả nhà
-   * ăn nên không có bộ phận thụ hưởng nào để gánh.
+   * khoảng lọc — chia đều cho các bộ phận người Việt như tiền sữa.
    */
   laborAmount: number;
   /** Số NGÀY CÔNG được tính tiền — không phải số người. */
   laborDays: number;
+  /**
+   * Tổng cột Thành Tiền của bảng phân bổ = suất ăn + phần sữa + phần nhân
+   * công đã chia được. Bằng mealAmount + milkAmount + laborAmount, trừ khi
+   * danh mục không còn bộ phận người Việt nào để chia.
+   */
+  allocatedAmount: number;
   /**
    * = mealAmount + milkAmount + extraAmount + laborAmount, đúng bằng TOTAL
    * của bảng kê suất ăn tháng.
@@ -1837,20 +1952,13 @@ export function reconcileCost(
   /* Đã cắt sẵn theo khoảng lọc lúc dựng — xem `buildLaborSegments`. */
   laborSegments: LaborSegment[] = [],
 ): CostReconciliation {
-  const mealAmount = deptRows.reduce((acc, d) => acc + d.totalAmount, 0);
+  const mealAmount = deptRows.reduce((acc, d) => acc + d.mealAmount, 0);
   const mealCount = deptRows.reduce((acc, d) => acc + d.totalMeals, 0);
 
   /* Gom bằng đúng `buildSupplySeries` để tiền ở đây và ở các dòng cấp phát
      của bảng kê tháng không thể ra hai con số. */
-  const sum = (rows: SupplySeries[]) => ({
-    amount: rows.reduce((acc, m) => acc + m.amount, 0),
-    count: rows.reduce((acc, m) => acc + m.series.total, 0),
-  });
-
-  const milk = sum(
-    buildSupplySeries(milkEntries.map(milkAsSupply)),
-  );
-  const extra = sum(
+  const milk = supplyTotals(buildSupplySeries(milkEntries.map(milkAsSupply)));
+  const extra = supplyTotals(
     buildSupplySeries(extraCosts.map(extraAsSupply)),
   );
 
@@ -1865,6 +1973,7 @@ export function reconcileCost(
     extraCount: extra.count,
     laborAmount,
     laborDays: laborTotalWorkDays(laborSegments),
+    allocatedAmount: deptRows.reduce((acc, d) => acc + d.totalAmount, 0),
     grandTotal: mealAmount + milk.amount + extra.amount + laborAmount,
   };
 }
@@ -1918,13 +2027,19 @@ export const yearlyValue = (row: MonthlyCostRow, key: keyof MonthlyCostRow) =>
   Number(row[key] ?? 0) || 0;
 
 /**
- * Cộng chi phí nhân công vào bảng 12 tháng, TỪNG THÁNG MỘT.
+ * Cộng chi phí nhân công vào bảng 12 tháng, TỪNG KỲ MỘT.
  *
  * SA_MealCost_GetMonthly không biết gì về nhân công và cố ý giữ nguyên như
  * vậy: phép chia tiền theo ngày làm việc đã có một bản cài đặt duy nhất ở
  * `buildLaborSegments`, chép nó sang T-SQL là tạo ra bản sao thứ hai để hai
  * bên lệch nhau — đúng thứ mà chú thích đầu file này cảnh báo. Ở đây chỉ gọi
- * lại chính hàm đó với khoảng lọc là từng tháng.
+ * lại chính hàm đó với khoảng lọc là KỲ của từng tháng.
+ *
+ * Kỳ lấy từ chính dòng SQL trả về (`fromDateTime` / `toDateTime`, cài ở tab
+ * Xu hướng năm), quy về ngày làm việc bằng `costWorkDayRange` — đúng như bộ
+ * lọc chính quy về ngày làm việc trước khi cắt đợt. Nên mọi cột của một dòng
+ * đều thuộc cùng một kỳ. Dòng không mang kỳ (procedure cũ) thì coi là tháng
+ * lịch.
  *
  * `Sum` được cộng lại chứ không lấy từ SQL, nếu không dòng tổng tháng sẽ nhỏ
  * hơn tổng các cột đúng bằng tiền nhân công.
@@ -1933,23 +2048,31 @@ export function withLaborCost(
   rows: MonthlyCostRow[],
   laborPeriods: LaborPeriodInput[],
   rule: LaborWorkDayRule,
+  shifts?: ShiftInfo[],
 ): MonthlyCostRow[] {
   return rows.map((row) => {
-    /* costMonth là "YYYY-MM". Ngày cuối tháng = mùng 1 tháng sau lùi một
-       ngày — đúng cả tháng 2 năm nhuận mà không phải nhớ bảng số ngày. */
-    const y = Number(row.costMonth.slice(0, 4));
-    const m = Number(row.costMonth.slice(5, 7));
-    const nextY = m === 12 ? y + 1 : y;
-    const nextM = m === 12 ? 1 : m + 1;
-    const monthStart = `${row.costMonth}-01`;
-    const monthEnd = addDays(
-      `${nextY}-${String(nextM).padStart(2, "0")}-01`,
-      -1,
-    );
+    let range: { from: string; to: string };
+    if (row.fromDateTime && row.toDateTime) {
+      range = costWorkDayRange(row.fromDateTime, row.toDateTime, shifts);
+    } else {
+      /* costMonth là "YYYY-MM". Ngày cuối tháng = mùng 1 tháng sau lùi một
+         ngày — đúng cả tháng 2 năm nhuận mà không phải nhớ bảng số ngày. */
+      const y = Number(row.costMonth.slice(0, 4));
+      const m = Number(row.costMonth.slice(5, 7));
+      const nextY = m === 12 ? y + 1 : y;
+      const nextM = m === 12 ? 1 : m + 1;
+      range = {
+        from: `${row.costMonth}-01`,
+        to: addDays(`${nextY}-${String(nextM).padStart(2, "0")}-01`, -1),
+      };
+    }
 
-    const labor = laborTotalAmount(
-      buildLaborSegments(laborPeriods, monthStart, monthEnd, rule),
-    );
+    const labor =
+      range.to < range.from
+        ? 0
+        : laborTotalAmount(
+            buildLaborSegments(laborPeriods, range.from, range.to, rule),
+          );
 
     return {
       ...row,

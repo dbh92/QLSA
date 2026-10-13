@@ -148,6 +148,32 @@ export interface MonthlyCostRow {
   ChiPhiNhanCong?: number;
   /** Tổng tháng. Đã gồm chi phí nhân công sau khi qua `withLaborCost`. */
   Sum: number;
+  /**
+   * KỲ của tháng, nửa mở [fromDateTime, toDateTime), "YYYY-MM-DD HH:mm:ss" —
+   * xem `CostMonthPeriod`. Mọi cột của dòng được SQL xếp theo kỳ này, và
+   * `withLaborCost` cắt chi phí nhân công theo đúng hai mốc này. Vắng khi máy
+   * chủ còn chạy procedure cũ — khi đó coi như tháng lịch.
+   */
+  fromDateTime?: string;
+  toDateTime?: string;
+}
+
+/**
+ * KỲ TÍNH CHI PHÍ của một tháng trong bảng 12 tháng (SA_CostMonthPeriod).
+ *
+ * Nửa mở: `fromDateTime` thuộc kỳ, `toDateTime` thì không — hai tháng nối
+ * tiếp dùng chung một mốc. Tháng chưa cài đặt mang kỳ mặc định (25 tháng
+ * trước 22:50 -> 25 tháng này 22:50) và `isCustom = false`.
+ */
+export interface CostMonthPeriod {
+  monthNo: number;
+  /** "YYYY-MM". */
+  costMonth: string;
+  /** "YYYY-MM-DD HH:mm:ss", thuộc kỳ. */
+  fromDateTime: string;
+  /** "YYYY-MM-DD HH:mm:ss", KHÔNG thuộc kỳ. */
+  toDateTime: string;
+  isCustom: boolean;
 }
 
 /** Tham số hệ thống đã ép kiểu (SA_SystemSetting). */
@@ -284,6 +310,12 @@ export interface LaborCostDraftRow {
   /** Tiền cho trọn đợt, VNĐ. */
   amount: number;
   notes: string | null;
+  /**
+   * 'YYYY-MM' người dùng gán ở ô "Tháng" — CHỈ LÀ NHÃN. Tiền chia theo ngày
+   * làm việc của khoảng ngày, bảng 12 tháng cắt theo kỳ của nó; không phép
+   * tính nào đọc trường này.
+   */
+  costMonth: string | null;
   updatedAt: string;
 }
 
@@ -296,6 +328,8 @@ export interface LaborCostAppliedRow {
   effectiveTo: string;
   amount: number;
   notes: string | null;
+  /** Nhãn tháng của đợt — xem `LaborCostDraftRow.costMonth`. */
+  costMonth: string | null;
 }
 
 /**

@@ -49,6 +49,8 @@ import {
   buildShiftPivot,
   dayLabel,
   reconcileCost,
+  sharesSupportCost,
+  supportCostRecipientCount,
   reportShiftLabel,
   shiftAlias,
   shiftWindow,
@@ -510,7 +512,9 @@ function buildDeptSheet(ws: ExcelJS.Worksheet, ctx: WorkbookContext) {
     ctx.classified,
     ctx.manualMeals,
     ctx.largeDeptOptions,
-    ctx.pricing
+    ctx.pricing,
+    ctx.milkEntries,
+    ctx.laborSegments
   );
   /* Suất sinh nhật mỗi ngày một giá, nên dòng đơn giá của sheet phải là bộ
      giá mà `buildDeptAllocation` vừa dùng để tính tiền — lấy `ctx.pricing`
@@ -528,13 +532,24 @@ function buildDeptSheet(ws: ExcelJS.Worksheet, ctx: WorkbookContext) {
     {} as Record<MealCategory, number>
   );
   const totalMeals = data.reduce((acc, d) => acc + d.totalMeals, 0);
-  const totalAmount = data.reduce((acc, d) => acc + d.totalAmount, 0);
+  const allocatedMilk = data.reduce((acc, d) => acc + d.milkShare, 0);
+  const allocatedLabor = data.reduce((acc, d) => acc + d.laborShare, 0);
+
+  const totals = reconcileCost(
+    data,
+    ctx.milkEntries,
+    ctx.extraCosts,
+    ctx.laborSegments
+  );
+  const recipients = supportCostRecipientCount(data);
 
   const colTotalMeals = 2 + CATEGORY_COLUMNS.length;
-  const colAmount = colTotalMeals + 1;
+  const colMilk = colTotalMeals + 1;
+  const colLabor = colMilk + 1;
+  const colAmount = colLabor + 1;
   const lastCol = colAmount;
 
-  setWidths(ws, [22, ...CATEGORY_COLUMNS.map(() => 15), 14, 20]);
+  setWidths(ws, [22, ...CATEGORY_COLUMNS.map(() => 15), 14, 17, 17, 20]);
 
   sheetHeading(
     ws,
@@ -567,6 +582,35 @@ function buildDeptSheet(ws: ExcelJS.Worksheet, ctx: WorkbookContext) {
     fill: C.slate800,
     wrap: true,
   });
+
+  /* Hai cột CHIA ĐỀU: hàng tiêu đề thứ hai giữ TỔNG TIỀN cần chia (một con
+     số thật), mỗi bộ phận người Việt = ô đó / số bộ phận. Sửa tổng tiền sữa
+     ở đây là cả cột và cột Thành Tiền tự chia lại — cùng cách dòng đơn giá
+     của các cột loại suất hoạt động. */
+  const milkHead: CellStyle = { fill: C.headMilkShare, font: C.textCyan100, border: C.slate700 };
+  const laborHead: CellStyle = { fill: C.headLaborShare, font: C.textTeal100, border: C.slate700 };
+  put(ws, TABLE_TOP, colMilk, `Tiền Sữa (chia đều ${recipients} BP)`, {
+    ...milkHead,
+    bold: true,
+    wrap: true,
+  });
+  put(ws, TABLE_TOP + 1, colMilk, totals.milkAmount, {
+    ...milkHead,
+    size: 10,
+    numFmt: NUM_FMT.vnd,
+  });
+  put(ws, TABLE_TOP, colLabor, `Nhân Công (chia đều ${recipients} BP)`, {
+    ...laborHead,
+    bold: true,
+    wrap: true,
+  });
+  put(ws, TABLE_TOP + 1, colLabor, totals.laborAmount, {
+    ...laborHead,
+    size: 10,
+    numFmt: NUM_FMT.vnd,
+  });
+  ws.getRow(TABLE_TOP).height = 30;
+
   block(ws, TABLE_TOP, colAmount, TABLE_TOP + 1, colAmount, 'Thành Tiền (VNĐ)', {
     ...head,
     fill: C.emerald600,
@@ -574,7 +618,7 @@ function buildDeptSheet(ws: ExcelJS.Worksheet, ctx: WorkbookContext) {
     wrap: true,
   });
 
-  /** Dòng chứa đơn giá từng loại suất — công thức Thành Tiền trỏ về đây. */
+  /** Dòng chứa đơn giá từng loại suất và tổng tiền cần chia — công thức trỏ về đây. */
   const priceRow = TABLE_TOP + 1;
 
   let r = TABLE_TOP + 2;
@@ -596,8 +640,30 @@ function buildDeptSheet(ws: ExcelJS.Worksheet, ctx: WorkbookContext) {
       d.totalMeals,
       { fill: C.slate50, bold: true, numFmt: NUM_FMT.int }
     );
+
+    /* KR và 'Khác' không gánh phần nào — ô để trống chứ không ghi 0, đúng
+       như dấu "-" trên web. Số bộ phận ghi thẳng vào công thức: nó là kết
+       quả của danh mục bộ phận, không phải một ô người dùng sửa. */
+    const shares = sharesSupportCost(d.deptName) && recipients > 0;
+    if (shares) {
+      formula(ws, r, colMilk, `${addr(priceRow, colMilk, true)}/${recipients}`, d.milkShare, {
+        font: C.cyan700,
+        align: 'right',
+        numFmt: NUM_FMT.vnd,
+      });
+      formula(ws, r, colLabor, `${addr(priceRow, colLabor, true)}/${recipients}`, d.laborShare, {
+        font: C.teal700,
+        align: 'right',
+        numFmt: NUM_FMT.vnd,
+      });
+    } else {
+      put(ws, r, colMilk, '', { numFmt: NUM_FMT.vnd });
+      put(ws, r, colLabor, '', { numFmt: NUM_FMT.vnd });
+    }
+
     /* Thành tiền = tích vô hướng số suất × dòng đơn giá (khoá bằng $ để kéo
-       công thức xuống các dòng dưới vẫn trỏ đúng dòng đơn giá). */
+       công thức xuống các dòng dưới vẫn trỏ đúng dòng đơn giá), cộng phần
+       sữa và phần nhân công của dòng. */
     formula(
       ws,
       r,
@@ -607,7 +673,7 @@ function buildDeptSheet(ws: ExcelJS.Worksheet, ctx: WorkbookContext) {
         2,
         colTotalMeals - 1,
         true
-      )})`,
+      )})+N(${addr(r, colMilk)})+N(${addr(r, colLabor)})`,
       d.totalAmount,
       { bold: true, align: 'right', numFmt: NUM_FMT.vnd }
     );
@@ -620,69 +686,47 @@ function buildDeptSheet(ws: ExcelJS.Worksheet, ctx: WorkbookContext) {
 
   const footer: CellStyle = { fill: C.slate900, font: C.white, bold: true, border: C.slate700 };
   put(ws, r, 1, 'TỔNG CỘNG PHÂN BỔ', { ...footer, align: 'left' });
-  CATEGORY_COLUMNS.forEach((c, i) => {
-    const col = 2 + i;
-    const style: CellStyle = { ...footer, font: C.white, numFmt: NUM_FMT.int };
-    if (hasData) {
-      formula(
-        ws,
-        r,
-        col,
-        `SUM(${colRange(col, firstDataRow, lastDataRow)})`,
-        categoryTotals[c],
-        style
-      );
-    } else {
-      put(ws, r, col, categoryTotals[c], style);
-    }
-  });
 
   const footTotal = (col: number, value: number, style: CellStyle) =>
     hasData
       ? formula(ws, r, col, `SUM(${colRange(col, firstDataRow, lastDataRow)})`, value, style)
       : put(ws, r, col, value, style);
 
+  CATEGORY_COLUMNS.forEach((c, i) => {
+    footTotal(2 + i, categoryTotals[c], { ...footer, font: C.white, numFmt: NUM_FMT.int });
+  });
   footTotal(colTotalMeals, totalMeals, {
     ...footer,
     font: C.amber500,
     numFmt: NUM_FMT.int,
   });
-  footTotal(colAmount, totalAmount, {
+  footTotal(colMilk, allocatedMilk, {
+    ...footer,
+    font: C.cyan300,
+    align: 'right',
+    numFmt: NUM_FMT.vnd,
+  });
+  footTotal(colLabor, allocatedLabor, {
+    ...footer,
+    font: C.teal300,
+    align: 'right',
+    numFmt: NUM_FMT.vnd,
+  });
+  footTotal(colAmount, totals.allocatedAmount, {
     ...footer,
     font: C.emerald400,
     align: 'right',
     numFmt: NUM_FMT.vnd,
   });
-  const mealAmountCell = addr(r, colAmount);
+  const allocatedAmountCell = addr(r, colAmount);
   ws.getRow(r).height = 22;
 
-  /* Đối chiếu với sheet "Thống kê suất ăn tháng": bảng này chỉ có tiền suất
-     ăn, chênh lệch giữa hai sheet đúng bằng tiền sữa. */
-  const totals = reconcileCost(
-    data,
-    ctx.milkEntries,
-    ctx.extraCosts,
-    ctx.laborSegments
-  );
+  /** Ô thành tiền của các dòng không phân bổ được cho bộ phận nào. */
+  const unallocatedCells: string[] = [];
 
-  /** Ô thành tiền của các dòng không phân bổ (sữa, phát sinh). */
-  const supplyAmountCells: string[] = [];
-
-  r += 1;
-  const milkTone: CellStyle = { fill: C.slate100, font: C.slate700, bold: true };
-  block(ws, r, 1, r, colTotalMeals - 1, 'Tiền sữa — cấp theo ngày, không phân bổ cho bộ phận nào', {
-    ...milkTone,
-    align: 'left',
-  });
-  put(ws, r, colTotalMeals, totals.milkCount, { ...milkTone, numFmt: NUM_FMT.int });
-  put(ws, r, colAmount, totals.milkAmount, {
-    ...milkTone,
-    font: C.indigo900,
-    align: 'right',
-    numFmt: NUM_FMT.vnd,
-  });
-  supplyAmountCells.push(addr(r, colAmount));
-
+  /* Đối chiếu với sheet "Thống kê suất ăn tháng": sữa và nhân công đã chia
+     vào các bộ phận ở hai cột trên, chỉ còn chi phí phát sinh là không có bộ
+     phận thụ hưởng. */
   if (totals.extraCount > 0 || totals.extraAmount > 0) {
     r += 1;
     const extraTone: CellStyle = { fill: C.violet50, font: C.violet900, bold: true };
@@ -691,41 +735,42 @@ function buildDeptSheet(ws: ExcelJS.Worksheet, ctx: WorkbookContext) {
       align: 'left',
     });
     put(ws, r, colTotalMeals, totals.extraCount, { ...extraTone, numFmt: NUM_FMT.int });
+    put(ws, r, colMilk, '', extraTone);
+    put(ws, r, colLabor, '', extraTone);
     put(ws, r, colAmount, totals.extraAmount, {
       ...extraTone,
       align: 'right',
       numFmt: NUM_FMT.vnd,
     });
-    supplyAmountCells.push(addr(r, colAmount));
+    unallocatedCells.push(addr(r, colAmount));
   }
 
-  /* Chi phí nhân công — cùng lý do với hai dòng trên: không có bộ phận thụ
-     hưởng nào để gánh, nên nó là dòng đối chiếu chứ không phải một cột của
-     bảng phân bổ. Ô "số lượng" là NGÀY CÔNG, không phải số suất ăn. */
-  if (totals.laborDays > 0 || totals.laborAmount > 0) {
+  /* Chỉ xuất hiện khi danh mục không còn bộ phận người Việt nào để chia. */
+  const unallocatedSupport =
+    totals.milkAmount + totals.laborAmount - allocatedMilk - allocatedLabor;
+  if (unallocatedSupport > 0.5) {
     r += 1;
-    const laborTone: CellStyle = { fill: C.teal50, font: C.teal900, bold: true };
-    block(ws, r, 1, r, colTotalMeals - 1, 'Chi phí nhân công — thuê theo đợt, không phân bổ cho bộ phận nào', {
-      ...laborTone,
+    const warnTone: CellStyle = { fill: C.amber100, font: C.amber900, bold: true };
+    block(ws, r, 1, r, colLabor, 'Sữa + nhân công chưa chia — danh mục không có bộ phận người Việt nào', {
+      ...warnTone,
       align: 'left',
     });
-    put(ws, r, colTotalMeals, totals.laborDays, { ...laborTone, numFmt: NUM_FMT.int });
-    put(ws, r, colAmount, totals.laborAmount, {
-      ...laborTone,
+    put(ws, r, colAmount, unallocatedSupport, {
+      ...warnTone,
       align: 'right',
       numFmt: NUM_FMT.vnd,
     });
-    supplyAmountCells.push(addr(r, colAmount));
+    unallocatedCells.push(addr(r, colAmount));
   }
 
   r += 1;
   const payTone: CellStyle = { fill: C.amber100, bold: true };
-  block(ws, r, 1, r, colTotalMeals, 'TỔNG THANH TOÁN (khớp với sheet "Thống kê suất ăn tháng")', {
+  block(ws, r, 1, r, colLabor, 'TỔNG THANH TOÁN (khớp với sheet "Thống kê suất ăn tháng")', {
     ...payTone,
     align: 'left',
   });
-  /* = tiền suất ăn + tiền sữa + chi phí phát sinh, cộng thẳng ba ô ngay trên. */
-  sumOf(ws, r, colAmount, [mealAmountCell, ...supplyAmountCells], totals.grandTotal, {
+  /* = tổng phân bổ (suất ăn + sữa + nhân công) + chi phí phát sinh. */
+  sumOf(ws, r, colAmount, [allocatedAmountCell, ...unallocatedCells], totals.grandTotal, {
     ...payTone,
     align: 'right',
     size: 12,
@@ -737,7 +782,7 @@ function buildDeptSheet(ws: ExcelJS.Worksheet, ctx: WorkbookContext) {
     ws,
     r + 2,
     lastCol,
-    'Người Hàn = thuộc bộ phận lớn KR, tính giá suất Hàn dù chấm ở máy nào. Các bộ phận còn lại luôn tính giá suất người Việt, kể cả khi chấm ở máy CT Korea. Loại suất của từng ca lấy theo tab Cấu Hình Giá Suất Ăn; suất của người Việt vào ngày sinh nhật tập thể tính giá suất đặc biệt. Bảng đã gồm cả suất nhập ở tab Nhập Thủ Công Ca, tính vào bộ phận thụ hưởng đã ghi khi nhập. Dòng TỔNG CỘNG PHÂN BỔ chỉ là tiền suất ăn — sữa và chi phí phát sinh cấp theo ngày nên không chia được cho bộ phận nào; dòng TỔNG THANH TOÁN mới là con số khớp với TOTAL của sheet "Thống kê suất ăn tháng".'
+    `Người Hàn = thuộc bộ phận lớn KR, tính giá suất Hàn dù chấm ở máy nào. Các bộ phận còn lại luôn tính giá suất người Việt, kể cả khi chấm ở máy CT Korea. Loại suất của từng ca lấy theo tab Cấu Hình Giá Suất Ăn; suất của người Việt vào ngày sinh nhật tập thể tính giá suất đặc biệt. Bảng đã gồm cả suất nhập ở tab Nhập Thủ Công Ca, tính vào bộ phận thụ hưởng đã ghi khi nhập. Tiền sữa và chi phí nhân công được chia đều cho ${recipients} bộ phận người Việt (không chia cho KR và "Khác"): tổng cần chia nằm ở hàng tiêu đề thứ hai của hai cột đó, sửa ở đó là cả cột tự chia lại. Chỉ chi phí phát sinh là không chia cho bộ phận nào; dòng TỔNG THANH TOÁN là con số khớp với TOTAL của sheet "Thống kê suất ăn tháng".`
   );
 
   ws.views = [{ state: 'frozen', xSplit: 1, ySplit: TABLE_TOP + 1 }];
