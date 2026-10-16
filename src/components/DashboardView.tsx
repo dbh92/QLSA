@@ -32,6 +32,7 @@ import {
   SUPPLY_SHIFT_LABEL,
   PunchDayCase,
   CountedManualMeal,
+  FREE_DUP_WINDOW_MINUTES,
 } from "../services/mealEngine";
 import { ManualMealsTable } from "./ManualMealsTable";
 import {
@@ -394,7 +395,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
      toàn bộ lượt quẹt của người vi phạm.
 
      Thẻ này hiện số BỊ TRỪ TIỀN, đúng bằng ô "Bị trừ tiền" của tab Suất Ăn
-     Mất Mát: quẹt trùng ca lại trong vòng 10 phút là thao tác lỗi, không ai
+     Mất Mát: quẹt trùng ca lại trong vòng FREE_DUP_WINDOW_MINUTES phút là thao tác lỗi, không ai
      ăn thêm suất nào nên không phải tiền thất thoát. Số không bị trừ vẫn hiện
      ở dòng phụ để không ai tưởng hệ thống bỏ sót. */
   const lossStats = useMemo(() => {
@@ -840,7 +841,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             setDrilldown({
               kind: "abnormal",
               title: "Suất Ăn Mất Mát",
-              subtitle: `${abnormalList.length.toLocaleString("vi-VN")} nhân sự • ${lossCount.toLocaleString("vi-VN")} suất bị trừ tiền — ${formatVND(lossAmount)}. Thêm ${lossStats.freeCount.toLocaleString("vi-VN")} suất quẹt lại dưới 10 phút không bị trừ tiền (${formatVND(lossStats.freeAmount)}). Mỗi dòng là một nhân sự trong một ngày làm việc.`,
+              subtitle: `${abnormalList.length.toLocaleString("vi-VN")} nhân sự • ${lossCount.toLocaleString("vi-VN")} suất bị trừ tiền — ${formatVND(lossAmount)}. Thêm ${lossStats.freeCount.toLocaleString("vi-VN")} suất quẹt lại dưới ${FREE_DUP_WINDOW_MINUTES} phút không bị trừ tiền (${formatVND(lossStats.freeAmount)}). Mỗi dòng là một nhân sự trong một ngày làm việc.`,
               rows: abnormalList,
             })
           }
@@ -864,7 +865,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             </div>
             <div className="text-[10px] text-slate-400 leading-tight">
               +{lossStats.freeCount.toLocaleString("vi-VN")} suất quẹt lại
-              &lt;10 phút không bị trừ
+              &lt;{FREE_DUP_WINDOW_MINUTES} phút không bị trừ
             </div>
           </div>
         </button>

@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ShiftCode, StaffType } from "../../types";
-import { formatVND } from "../../services/mealEngine";
+import { formatVND, FREE_DUP_WINDOW_MINUTES } from "../../services/mealEngine";
 import * as api from "../../services/api";
 import {
   AdHocDeduction,
@@ -730,7 +730,7 @@ export const CostAdjustmentDialog: React.FC<CostAdjustmentDialogProps> = ({
                 })}
                 <p className="text-[11px] text-slate-500">
                   Suất &ldquo;không bị trừ tiền&rdquo; là lượt quẹt lại trong
-                  vòng 10 phút — không ai ăn thêm suất nào.
+                  vòng {FREE_DUP_WINDOW_MINUTES} phút — không ai ăn thêm suất nào.
                   &ldquo;Chỉ suất bị trừ tiền&rdquo; bỏ qua các lượt đó;
                   &ldquo;Chỉ trừ suất ăn không bị trừ tiền&rdquo; thì ngược
                   lại, chỉ xóa đúng các lượt đó.

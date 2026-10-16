@@ -925,7 +925,7 @@ export type PunchLossReason = "TRUNG_CA" | "VUOT_HAN_MUC";
 export type LossCharge = "BI_TRU" | "KHONG_TRU";
 
 /** Quẹt trùng ca trong vòng ngần này phút thì không trừ tiền. */
-export const FREE_DUP_WINDOW_MINUTES = 10;
+export const FREE_DUP_WINDOW_MINUTES = 3;
 
 export interface EvaluatedPunch {
   log: MealLog;
@@ -933,7 +933,7 @@ export interface EvaluatedPunch {
   reason: PunchLossReason | null;
   /**
    * Số phút kể từ lượt quẹt LIỀN TRƯỚC trong cùng ngày làm việc; null nếu là
-   * lượt đầu tiên của ngày. Có phần thập phân để so "dưới 10 phút" cho đúng.
+   * lượt đầu tiên của ngày. Có phần thập phân để so "dưới 3 phút" cho đúng.
    */
   gapMinutes: number | null;
   /** Chỉ có giá trị khi `isLoss`. */
@@ -1024,7 +1024,7 @@ export function evaluatePunchDays(
 
       if (seenShifts.has(log.shiftCode)) {
         dupShiftCount += 1;
-        /* Quẹt lại trong vòng 10 phút = thao tác lỗi, không ai ăn thêm suất
+        /* Quẹt lại trong vòng FREE_DUP_WINDOW_MINUTES phút = thao tác lỗi, không ai ăn thêm suất
            nào nên không trừ tiền. */
         const charge: LossCharge =
           gapMinutes !== null && gapMinutes < FREE_DUP_WINDOW_MINUTES
